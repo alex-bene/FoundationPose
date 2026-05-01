@@ -1,46 +1,77 @@
-# FoundationPose: Unified 6D Pose Estimation and Tracking of Novel Objects
-[[Paper]](https://arxiv.org/abs/2312.08344) [[Website]](https://nvlabs.github.io/FoundationPose/)
+# FoundationPose
 
-This is the official implementation of our paper to be appeared in CVPR 2024 (Highlight)
+[![pre-commit.ci status](https://results.pre-commit.ci/badge/github/alex-bene/FoundationPose/main.svg)](https://results.pre-commit.ci/latest/github/alex-bene/FoundationPose/main)
+[![Development Status](https://img.shields.io/badge/status-beta-orange)](https://github.com/alex-bene/FoundationPose)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
+[![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
 
-Contributors: Bowen Wen, Wei Yang, Jan Kautz, Stan Birchfield
+[[Paper]](https://arxiv.org/abs/2312.08344) [[Original implementation]](https://github.com/NVlabs/FoundationPose) [[Website]](https://nvlabs.github.io/FoundationPose/)
 
-We present FoundationPose, a unified foundation model for 6D object pose estimation and tracking, supporting both model-based and model-free setups. Our approach can be instantly applied at test-time to a novel object without fine-tuning, as long as its CAD model is given, or a small number of reference images are captured. We bridge the gap between these two setups with a neural implicit representation that allows for effective novel view synthesis, keeping the downstream pose estimation modules invariant under the same unified framework. Strong generalizability is achieved via large-scale synthetic training, aided by a large language model (LLM), a novel transformer-based architecture, and contrastive learning formulation. Extensive evaluation on multiple public datasets involving challenging scenarios and objects indicate our unified approach outperforms existing methods specialized for each task by a large margin. In addition, it even achieves comparable results to instance-level methods despite the reduced assumptions.
+This repository is a simplified fork of the original [NVLabs FoundationPose implementation](https://github.com/NVlabs/FoundationPose), refactored as an installable Python package.
 
+The goal of this fork is packaging and simplification, not preserving the full upstream repository workflow.
 
-<img src="assets/intro.jpg" width="70%">
+## What Changed In This Fork
 
-**🤖 For ROS version, please check [Isaac ROS Pose Estimation](https://github.com/NVIDIA-ISAAC-ROS/isaac_ros_pose_estimation), which enjoys TRT fast inference and C++ speed up.**
+- The codebase has been refactored into an installable package under `src/foundationpose`.
+- Installation is intended to happen directly from GitHub with `uv`.
+- The original `mycpp` extension has been removed.
+- Pose clustering now uses a simplified pure-Python implementation from [CARI4D](https://github.com/NVlabs/CARI4D).
+- This fork is focused on the inference-oriented package code path.
+- Removed debugging visualization logic
 
-\
-**🥇 No. 1 on the world-wide [BOP leaderboard](https://bop.felk.cvut.cz/leaderboards/pose-estimation-unseen-bop23/core-datasets/) (as of 2024/03) for model-based novel object pose estimation.**
-<img src="assets/bop.jpg" width="80%">
+## Installation
 
-## Demos
+This package is intended to be installed directly from GitHub with `uv`.
 
-Robotic Applications:
+```bash
+uv add git+https://github.com/alex-bene/FoundationPose.git"
+```
 
-https://github.com/NVlabs/FoundationPose/assets/23078192/aa341004-5a15-4293-b3da-000471fd74ed
+## Pretrained Weights
 
+Download the original FoundationPose network weights from the upstream release assets [here](https://drive.google.com/drive/folders/1DFezOAD0oD1BblsXVxqDsl8fj0qzB82i?usp=sharing).
 
-AR Applications:
+You will need:
 
-https://github.com/NVlabs/FoundationPose/assets/23078192/80e96855-a73c-4bee-bcef-7cba92df55ca
+- Refiner: `2023-10-28-18-33-37`
+- Scorer: `2024-01-11-20-02-45`
 
+Keep them in a local checkpoints directory and pass that directory when constructing the predictors.
 
-Results on YCB-Video dataset:
+You can download them using:
+```bash
+uvx gdown --folder --output [CHECKPOINTS_DIR] https://drive.google.com/drive/folders/1DFezOAD0oD1BblsXVxqDsl8fj0qzB82i
+```
 
-https://github.com/NVlabs/FoundationPose/assets/23078192/9b5bedde-755b-44ed-a973-45ec85a10bbe
+## Minimal Usage
 
+```python
+from foundationpose.estimater import FoundationPose
+from foundationpose.learning.training.predict_pose_refine import PoseRefinePredictor
+from foundationpose.learning.training.predict_score import ScorePredictor
 
+checkpoints_dir = "/path/to/weights"
 
-# Bibtex
+refiner = PoseRefinePredictor(checkpoints_dir=checkpoints_dir)
+scorer = ScorePredictor(checkpoints_dir=checkpoints_dir)
+
+estimator = FoundationPose(
+    model_normals=model_normals,
+    mesh=mesh,
+    scorer=scorer,
+    refiner=refiner,
+)
+```
+
+## Bibtex
+
 ```bibtex
 @InProceedings{foundationposewen2024,
-author        = {Bowen Wen, Wei Yang, Jan Kautz, Stan Birchfield},
-title         = {{FoundationPose}: Unified 6D Pose Estimation and Tracking of Novel Objects},
-booktitle     = {CVPR},
-year          = {2024},
+  author        = {Bowen Wen, Wei Yang, Jan Kautz, Stan Birchfield},
+  title         = {{FoundationPose}: Unified 6D Pose Estimation and Tracking of Novel Objects},
+  booktitle     = {CVPR},
+  year          = {2024},
 }
 ```
 
@@ -48,179 +79,27 @@ If you find the model-free setup useful, please also consider cite:
 
 ```bibtex
 @InProceedings{bundlesdfwen2023,
-author        = {Bowen Wen and Jonathan Tremblay and Valts Blukis and Stephen Tyree and Thomas M\"{u}ller and Alex Evans and Dieter Fox and Jan Kautz and Stan Birchfield},
-title         = {{BundleSDF}: {N}eural 6-{DoF} Tracking and {3D} Reconstruction of Unknown Objects},
-booktitle     = {CVPR},
-year          = {2023},
+  author        = {Bowen Wen and Jonathan Tremblay and Valts Blukis and Stephen Tyree and Thomas M\"{u}ller and Alex Evans and Dieter Fox and Jan Kautz and Stan Birchfield},
+  title         = {{BundleSDF}: {N}eural 6-{DoF} Tracking and {3D} Reconstruction of Unknown Objects},
+  booktitle     = {CVPR},
+  year          = {2023},
 }
 ```
 
-# Data prepare
+Also, consider citing CARI4D since we use their implementation for `cluster_poses`:
 
-
-1) Download all network weights from [here](https://drive.google.com/drive/folders/1DFezOAD0oD1BblsXVxqDsl8fj0qzB82i?usp=sharing) and put them under the folder `weights/`. For the refiner, you will need `2023-10-28-18-33-37`. For scorer, you will need `2024-01-11-20-02-45`.
-
-1) [Download demo data](https://drive.google.com/drive/folders/1pRyFmxYXmAnpku7nGRioZaKrVJtIsroP?usp=sharing) and extract them under the folder `demo_data/`
-
-1) [Optional] Download our large-scale training data: ["FoundationPose Dataset"](https://drive.google.com/drive/folders/1s4pB6p4ApfWMiMjmTXOFco8dHbNXikp-?usp=sharing)
-
-1) [Optional] Download our preprocessed reference views [here](https://drive.google.com/drive/folders/1PXXCOJqHXwQTbwPwPbGDN9_vLVe0XpFS?usp=sharing) in order to run model-free few-shot version.
-
-# Env setup option 1: docker (recommended)
-  ```
-  cd docker/
-  docker pull wenbowen123/foundationpose && docker tag wenbowen123/foundationpose foundationpose  # Or to build from scratch: docker build --network host -t foundationpose .
-  bash docker/run_container.sh
-  ```
-
-
-If it's the first time you launch the container, you need to build extensions. Run this command *inside* the Docker container.
-```
-bash build_all.sh
+```bibtex
+@inproceedings{xie2026cari4d,
+  title = {CARI4D: Category Agnostic 4D Reconstruction of Human-Object Interaction},
+  author = {Xie, Xianghui and Wen, Bowen and Chang, Yan and Rabeti, Hesam and Li, Jiefeng and Yuan, Ye and Pons-Moll, Gerard and Birchfield, Stan},
+  booktitle = {Conference on Computer Vision and Pattern Recognition ({CVPR})},
+  month = {June},
+  year = {2026},
+}
 ```
 
-Later you can execute into the container without re-build.
-```
-docker exec -it foundationpose bash
-```
+## License
 
-For more recent GPU such as 4090, refer to [this](https://github.com/NVlabs/FoundationPose/issues/27).
-In short, do the following:
-```
-docker pull shingarey/foundationpose_custom_cuda121:latest
-```
-Then modify the bash script to use this image instead of `foundationpose:latest`.
+This fork keeps the same license as the original repository: the NVIDIA Source Code License.
 
-
-# Env setup option 2: conda (local)
-
-1) **Create the environment** (C++ build deps + Python; all on `conda-forge`):
-
-```bash
-conda env create -f environment.yml
-conda activate foundationpose
-```
-
-2) **Install PyTorch** with a CUDA build that matches your machine. The [PyTorch “Get Started”](https://pytorch.org/get-started/locally/) page lists the right `--index-url` (for example `cu124` works on most current NVIDIA drivers). Example:
-
-```bash
-python -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
-```
-
-3) **Install PyTorch3D and NVDiffRast** (compile from source; needs the CUDA toolkit for `nvcc`. Point `CUDA_HOME` at your install, e.g. `/usr/local/cuda-12.8` or `/usr/local/cuda`):
-
-```bash
-export CUDA_HOME=/usr/local/cuda   # or e.g. /usr/local/cuda-12.8
-export PATH="$CUDA_HOME/bin:$PATH"
-python -m pip install --no-build-isolation "git+https://github.com/facebookresearch/pytorch3d.git"
-python -m pip install --no-build-isolation "git+https://github.com/NVlabs/nvdiffrast.git"
-```
-
-`--no-build-isolation` is required so the build can see the `torch` you already installed.
-
-4) **Install remaining Python dependencies** and **build the `mycpp` extension** (BundleSDF’s `mycuda` step is optional; skip it unless you need the model-free / NeRF path):
-
-```bash
-python -m pip install -r requirements.txt
-bash build_all_conda.sh
-```
-
-5) **Optional — Kaolin** (only for the model-free setup; version must match your PyTorch/CUDA—see the [Kaolin install docs](https://kaolin.readthedocs.io/en/latest/notes/installation.html)).
-
-
-# Run model-based demo
-The paths have been set in argparse by default. If you need to change the scene, you can pass the args accordingly. By running on the demo data, you should be able to see the robot manipulating the mustard bottle. Pose estimation is conducted on the first frame, then it automatically switches to tracking mode for the rest of the video. The resulting visualizations will be saved to the `debug_dir` specified in the argparse. (Note the first time running could be slower due to online compilation)
-```
-python run_demo.py
-```
-
-
-<img src="assets/demo.jpg" width="50%">
-
-
-Feel free to try on other objects (**no need to retrain**) such as driller, by changing the paths in argparse.
-
-<img src="assets/demo_driller.jpg" width="50%">
-
-
-# Run on public datasets (LINEMOD, YCB-Video)
-
-For this you first need to download LINEMOD dataset and YCB-Video dataset.
-
-To run model-based version on these two datasets respectively, set the paths based on where you download. The results will be saved to `debug` folder
-```
-python run_linemod.py --linemod_dir /mnt/9a72c439-d0a7-45e8-8d20-d7a235d02763/DATASET/LINEMOD --use_reconstructed_mesh 0
-
-python run_ycb_video.py --ycbv_dir /mnt/9a72c439-d0a7-45e8-8d20-d7a235d02763/DATASET/YCB_Video --use_reconstructed_mesh 0
-```
-
-To run model-free few-shot version. You first need to train Neural Object Field. `ref_view_dir` is based on where you download in the above "Data prepare" section. Set the `dataset` flag to your interested dataset.
-```
-python bundlesdf/run_nerf.py --ref_view_dir /mnt/9a72c439-d0a7-45e8-8d20-d7a235d02763/DATASET/YCB_Video/bowen_addon/ref_views_16 --dataset ycbv
-```
-
-Then run the similar command as the model-based version with some small modifications. Here we are using YCB-Video as example:
-```
-python run_ycb_video.py --ycbv_dir /mnt/9a72c439-d0a7-45e8-8d20-d7a235d02763/DATASET/YCB_Video --use_reconstructed_mesh 1 --ref_view_dir /mnt/9a72c439-d0a7-45e8-8d20-d7a235d02763/DATASET/YCB_Video/bowen_addon/ref_views_16
-```
-
-# Troubleshooting
-
-
-- For more recent GPU such as 4090, refer to [this](https://github.com/NVlabs/FoundationPose/issues/27).
-
-- For setting up on Windows, refer to [this](https://github.com/NVlabs/FoundationPose/issues/148).
-
-- If you are getting unreasonable results, check [this](https://github.com/NVlabs/FoundationPose/issues/44#issuecomment-2048141043) and [this](https://github.com/030422Lee/FoundationPose_manual)
-
-# Training data download
-Our training data include scenes using 3D assets from GSO and Objaverse, rendered with high quality photo-realism and large domain randomization. Each data point includes **RGB, depth, object pose, camera pose, instance segmentation, 2D bounding box**. [[Google Drive]](https://drive.google.com/drive/folders/1s4pB6p4ApfWMiMjmTXOFco8dHbNXikp-?usp=sharing).
-
-<img src="assets/train_data_vis.png" width="80%">
-
-- To parse the camera params including extrinsics and intrinsics
-  ```
-  glcam_in_cvcam = np.array([[1,0,0,0],
-                          [0,-1,0,0],
-                          [0,0,-1,0],
-                          [0,0,0,1]]).astype(float)
-  W, H = camera_params["renderProductResolution"]
-  with open(f'{base_dir}/camera_params/camera_params_000000.json','r') as ff:
-    camera_params = json.load(ff)
-  world_in_glcam = np.array(camera_params['cameraViewTransform']).reshape(4,4).T
-  cam_in_world = np.linalg.inv(world_in_glcam)@glcam_in_cvcam
-  world_in_cam = np.linalg.inv(cam_in_world)
-  focal_length = camera_params["cameraFocalLength"]
-  horiz_aperture = camera_params["cameraAperture"][0]
-  vert_aperture = H / W * horiz_aperture
-  focal_y = H * focal_length / vert_aperture
-  focal_x = W * focal_length / horiz_aperture
-  center_y = H * 0.5
-  center_x = W * 0.5
-
-  fx, fy, cx, cy = focal_x, focal_y, center_x, center_y
-  K = np.eye(3)
-  K[0,0] = fx
-  K[1,1] = fy
-  K[0,2] = cx
-  K[1,2] = cy
-  ```
-
-
-
-# Notes
-Due to the legal restrictions of Stable-Diffusion that is trained on LAION dataset, we are not able to release the diffusion-based texture augmented data, nor the pretrained weights using it. We thus release the version without training on diffusion-augmented data. Slight performance degradation is expected.
-
-# Acknowledgement
-
-We would like to thank Jeff Smith for helping with the code release; NVIDIA Isaac Sim and Omniverse team for the support on synthetic data generation; Tianshi Cao for the valuable discussions. Finally, we are also grateful for the positive feebacks and constructive suggestions brought up by reviewers and AC at CVPR.
-
-<img src="assets/cvpr_review.png" width="100%">
-
-
-# License
-The code and data are released under the NVIDIA Source Code License. Copyright © 2024, NVIDIA Corporation. All rights reserved.
-
-
-# Contact
-For questions, please contact [Bowen Wen](https://wenbowen123.github.io/).
+The underlying FoundationPose code originates from NVIDIA / NVLabs, and this repository is a derivative packaging and refactoring effort. We do not claim ownership of the original FoundationPose codebase or attempt to relicense it. See [LICENSE](LICENSE).
