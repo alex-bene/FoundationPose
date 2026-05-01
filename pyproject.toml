@@ -1,0 +1,164 @@
+[project]
+name = "foundationpose"
+version = "0.1.0"
+description = ""
+keywords = ["pose", "foundationpose", "3d"]
+
+readme = "README.md"
+license-files = ["LICEN[CS]E*"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Programming Language :: Python :: 3",
+]
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "torch>=2.6.0",
+    "torchvision>=0.21.0",
+    "trimesh",
+    "opencv-contrib-python-headless",
+    "nvdiffrast",
+    "kornia>=0.7",
+    "ruamel-yaml>=0.18",
+    "transformations",
+    "omegaconf>=2.3.0",
+    "tqdm",
+    "imageio",
+    "h5py",
+    "scipy",
+    "scikit-learn",
+    "warp-lang",
+    "numpy>=2",
+    "open3d",
+]
+
+[project.optional-dependencies]
+src_cpu = ["torch==2.8.0", "pytorch3d==0.7.8", "kaolin"]
+src_cu124 = ["torch==2.6.0", "pytorch3d==0.7.8", "kaolin"]
+src_cu126 = ["torch==2.8.0", "pytorch3d==0.7.8", "kaolin"]
+src_cu128 = ["torch==2.8.0", "pytorch3d==0.7.8", "kaolin"]
+cpu = ["torch==2.8.0", "pytorch3d==0.7.8+pt2.8.0cpu", "kaolin"]
+cu124 = ["torch==2.6.0", "pytorch3d==0.7.8+pt2.6.0cu124", "kaolin"]
+cu126 = ["torch==2.8.0", "pytorch3d==0.7.8+pt2.8.0cu126", "kaolin"]
+cu128 = ["torch==2.8.0", "pytorch3d==0.7.8+pt2.8.0cu128", "kaolin"]
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cpu", extra = "cpu" },
+    { index = "pytorch-cpu", extra = "src_cpu" },
+    { index = "pytorch-cu124", extra = "cu124" },
+    { index = "pytorch-cu124", extra = "src_cu124" },
+    { index = "pytorch-cu126", extra = "cu126" },
+    { index = "pytorch-cu126", extra = "src_cu126" },
+    { index = "pytorch-cu128", extra = "cu128" },
+    { index = "pytorch-cu128", extra = "src_cu128" },
+]
+pytorch3d = [
+    { index = "pytorch3d-wheels", extra = "cpu" },
+    { index = "pytorch3d-wheels", extra = "cu124" },
+    { index = "pytorch3d-wheels", extra = "cu126" },
+    { index = "pytorch3d-wheels", extra = "cu128" },
+    { git = "https://github.com/facebookresearch/pytorch3d.git", extra = "src_cpu" },
+    { git = "https://github.com/facebookresearch/pytorch3d.git", extra = "src_cu124" },
+    { git = "https://github.com/facebookresearch/pytorch3d.git", extra = "src_cu126" },
+    { git = "https://github.com/facebookresearch/pytorch3d.git", extra = "src_cu128" },
+]
+kaolin = [
+    { index = "kaolin-cpu", extra = "cpu" },
+    { index = "kaolin-cpu", extra = "src_cpu" },
+    { index = "kaolin-cu124", extra = "cu124" },
+    { index = "kaolin-cu124", extra = "src_cu124" },
+    { index = "kaolin-cu126", extra = "cu126" },
+    { index = "kaolin-cu126", extra = "src_cu126" },
+    { index = "kaolin-cu128", extra = "cu128" },
+    { index = "kaolin-cu128", extra = "src_cu128" },
+]
+
+nvdiffrast = { git = "https://github.com/NVlabs/nvdiffrast.git" }
+
+[tool.uv.extra-build-dependencies]
+nvidia-pyindex = ["pip"]
+pytorch3d = ["torch", "setuptools"]
+nvdiffrast = [{ requirement = "torch", match-runtime = true }]
+
+[tool.uv.extra-build-variables]
+pytorch3d = { FORCE_CUDA = "1" }
+
+[tool.uv]
+conflicts = [
+    [
+        { extra = "src_cpu" },
+        { extra = "src_cu124" },
+        { extra = "src_cu126" },
+        { extra = "src_cu128" },
+        { extra = "cpu" },
+        { extra = "cu124" },
+        { extra = "cu126" },
+        { extra = "cu128" },
+    ],
+]
+
+[[tool.uv.index]]
+name = "kaolin-cpu"
+url = "https://nvidia-kaolin.s3.us-east-2.amazonaws.com/torch-2.8.0_cpu.html"
+format = "flat"
+explicit = true
+
+[[tool.uv.index]]
+name = "kaolin-cu124"
+url = "https://nvidia-kaolin.s3.us-east-2.amazonaws.com/torch-2.6.0_cu124.html"
+format = "flat"
+explicit = true
+
+[[tool.uv.index]]
+name = "kaolin-cu126"
+url = "https://nvidia-kaolin.s3.us-east-2.amazonaws.com/torch-2.8.0_cu126.html"
+format = "flat"
+explicit = true
+
+[[tool.uv.index]]
+name = "kaolin-cu128"
+url = "https://nvidia-kaolin.s3.us-east-2.amazonaws.com/torch-2.8.0_cu128.html"
+format = "flat"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch3d-wheels"
+url = "https://miropsota.github.io/torch_packages_builder"
+explicit = true
+
+[dependency-groups]
+dev = [
+    "icecream>=2.1.7",
+    "notebook>=7.3.2",
+    "ruff>=0.13.3",
+    "pre-commit>=3.7.1",
+    "ipywidgets>=8.1.5",
+]
+
+[build-system]
+requires = ["uv_build>=0.10.12,<0.11.0"]
+build-backend = "uv_build"
+
+[tool.pyright]
+exclude = ["**/__pycache__", "**/node_modules", "**/.venv", "**/.*", "*.ipynb"]
+typeCheckingMode = "off"
