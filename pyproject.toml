@@ -18,28 +18,25 @@ dependencies = [
     "opencv-contrib-python-headless",
     "nvdiffrast",
     "kornia>=0.7",
-    "ruamel-yaml>=0.18",
     "transformations",
     "omegaconf>=2.3.0",
-    "tqdm",
     "imageio",
     "h5py",
     "scipy",
-    "scikit-learn",
     "warp-lang",
     "numpy>=2",
     "open3d",
 ]
 
 [project.optional-dependencies]
-src_cpu = ["torch==2.8.0", "pytorch3d==0.7.8", "kaolin"]
-src_cu124 = ["torch==2.6.0", "pytorch3d==0.7.8", "kaolin"]
-src_cu126 = ["torch==2.8.0", "pytorch3d==0.7.8", "kaolin"]
-src_cu128 = ["torch==2.8.0", "pytorch3d==0.7.8", "kaolin"]
-cpu = ["torch==2.8.0", "pytorch3d==0.7.8+pt2.8.0cpu", "kaolin"]
-cu124 = ["torch==2.6.0", "pytorch3d==0.7.8+pt2.6.0cu124", "kaolin"]
-cu126 = ["torch==2.8.0", "pytorch3d==0.7.8+pt2.8.0cu126", "kaolin"]
-cu128 = ["torch==2.8.0", "pytorch3d==0.7.8+pt2.8.0cu128", "kaolin"]
+src_cpu = ["torch==2.8.0", "pytorch3d==0.7.8"]
+src_cu124 = ["torch==2.6.0", "pytorch3d==0.7.8"]
+src_cu126 = ["torch==2.8.0", "pytorch3d==0.7.8"]
+src_cu128 = ["torch==2.8.0", "pytorch3d==0.7.8"]
+cpu = ["torch==2.8.0", "pytorch3d==0.7.8+pt2.8.0cpu"]
+cu124 = ["torch==2.6.0", "pytorch3d==0.7.8+pt2.6.0cu124"]
+cu126 = ["torch==2.8.0", "pytorch3d==0.7.8+pt2.8.0cu126"]
+cu128 = ["torch==2.8.0", "pytorch3d==0.7.8+pt2.8.0cu128"]
 
 [tool.uv.sources]
 torch = [
@@ -61,16 +58,6 @@ pytorch3d = [
     { git = "https://github.com/facebookresearch/pytorch3d.git", extra = "src_cu124" },
     { git = "https://github.com/facebookresearch/pytorch3d.git", extra = "src_cu126" },
     { git = "https://github.com/facebookresearch/pytorch3d.git", extra = "src_cu128" },
-]
-kaolin = [
-    { index = "kaolin-cpu", extra = "cpu" },
-    { index = "kaolin-cpu", extra = "src_cpu" },
-    { index = "kaolin-cu124", extra = "cu124" },
-    { index = "kaolin-cu124", extra = "src_cu124" },
-    { index = "kaolin-cu126", extra = "cu126" },
-    { index = "kaolin-cu126", extra = "src_cu126" },
-    { index = "kaolin-cu128", extra = "cu128" },
-    { index = "kaolin-cu128", extra = "src_cu128" },
 ]
 
 nvdiffrast = { git = "https://github.com/NVlabs/nvdiffrast.git" }
@@ -96,30 +83,6 @@ conflicts = [
         { extra = "cu128" },
     ],
 ]
-
-[[tool.uv.index]]
-name = "kaolin-cpu"
-url = "https://nvidia-kaolin.s3.us-east-2.amazonaws.com/torch-2.8.0_cpu.html"
-format = "flat"
-explicit = true
-
-[[tool.uv.index]]
-name = "kaolin-cu124"
-url = "https://nvidia-kaolin.s3.us-east-2.amazonaws.com/torch-2.6.0_cu124.html"
-format = "flat"
-explicit = true
-
-[[tool.uv.index]]
-name = "kaolin-cu126"
-url = "https://nvidia-kaolin.s3.us-east-2.amazonaws.com/torch-2.8.0_cu126.html"
-format = "flat"
-explicit = true
-
-[[tool.uv.index]]
-name = "kaolin-cu128"
-url = "https://nvidia-kaolin.s3.us-east-2.amazonaws.com/torch-2.8.0_cu128.html"
-format = "flat"
-explicit = true
 
 [[tool.uv.index]]
 name = "pytorch-cpu"

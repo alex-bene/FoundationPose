@@ -6,10 +6,14 @@
 # distribution of this software and related documentation without an express
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 
+"""HDF5 dataset classes for pose estimation training."""
+
+from __future__ import annotations
 
 import logging
-import os
 import pickle
+from pathlib import Path
+from typing import TYPE_CHECKING
 
 import h5py
 import imageio
@@ -20,30 +24,32 @@ from torch.utils.data import Dataset
 
 from foundationpose.Utils import depth2xyzmap_batch
 
-from .pose_dataset import BatchPoseData
+if TYPE_CHECKING:
+    from .pose_dataset import BatchPoseData
+
+logger = logging.getLogger(__name__)
 
 
 class PairH5Dataset(Dataset):
-    def __init__(self, cfg, h5_file, mode="train", max_num_key=None, cache_data=None):
+    """HDF5 dataset for loading paired observation data."""
+
+    def __init__(self, cfg: dict, h5_file: str, mode: str = "train", max_num_key: int | None = None) -> None:
         self.cfg = cfg
         self.h5_file = h5_file
         self.mode = mode
 
-        logging.info(f"self.h5_file:{self.h5_file}")
+        logger.debug("self.h5_file:%s", self.h5_file)
         self.n_perturb = None
         self.H_ori = None
         self.W_ori = None
-        self.cache_data = cache_data
 
-        if self.mode == "test":
-            pass
-        else:
+        if self.mode != "test":
             self.object_keys = []
-            key_file = h5_file.replace(".h5", "_keys.pkl")
-            if os.path.exists(key_file):
-                with open(key_file, "rb") as ff:
-                    self.object_keys = pickle.load(ff)
-                logging.info(f"object_keys loaded#:{len(self.object_keys)} from {key_file}")
+            key_file = Path(h5_file.replace(".h5", "_keys.pkl"))
+            if key_file.exists():
+                with key_file.open("rb") as ff:
+                    self.object_keys = pickle.load(ff)  # noqa: S301
+                logger.debug("object_keys loaded#:%d from %s", len(self.object_keys), key_file)
                 if max_num_key is not None:
                     self.object_keys = self.object_keys[:max_num_key]
             else:
@@ -51,10 +57,10 @@ class PairH5Dataset(Dataset):
                     for k in hf:
                         self.object_keys.append(k)
                         if max_num_key is not None and len(self.object_keys) >= max_num_key:
-                            logging.info("break due to max_num_key")
+                            logger.debug("break due to max_num_key")
                             break
 
-            logging.info(f"self.object_keys#:{len(self.object_keys)}, max_num_key:{max_num_key}")
+            logger.debug("self.object_keys#:%d, max_num_key:%s", len(self.object_keys), max_num_key)
 
             with h5py.File(h5_file, "r", libver="latest") as hf:
                 group = hf[self.object_keys[0]]
@@ -72,14 +78,16 @@ class PairH5Dataset(Dataset):
                             self.H_ori = 540
                             self.W_ori = 720
                 self.n_perturb = cnt
-                logging.info(f"self.n_perturb:{self.n_perturb}")
+                logger.debug("self.n_perturb:%d", self.n_perturb)
 
-    def __len__(self):
+    def __len__(self) -> int:
+        """Return the number of samples in the dataset."""
         if self.mode == "test":
             return 1
         return len(self.object_keys)
 
-    def transform_depth_to_xyzmap(self, batch: BatchPoseData, H_ori, W_ori, bound=1):
+    def transform_depth_to_xyzmap(self, batch: BatchPoseData, H_ori: int, W_ori: int) -> BatchPoseData:
+        """Transform depth maps to XYZ coordinate maps."""
         bs = len(batch.rgbAs)
         H, W = batch.rgbAs.shape[-2:]
         mesh_radius = batch.mesh_diameters.cuda() / 2
@@ -136,23 +144,25 @@ class PairH5Dataset(Dataset):
 
         return batch
 
-    def transform_batch(self, batch: BatchPoseData, H_ori, W_ori, bound=1):
-        """Transform the batch before feeding to the network
-        !NOTE the H_ori, W_ori could be different at test time from the training data, and needs to be set
+    def transform_batch(self, batch: BatchPoseData, H_ori: int, W_ori: int) -> BatchPoseData:
+        """Transform the batch before feeding to the network.
+
+        Note: H_ori, W_ori could be different at test time from the training data, and needs to be set
         """
-        bs = len(batch.rgbAs)
         batch.rgbAs = batch.rgbAs.cuda().float() / 255.0
         batch.rgbBs = batch.rgbBs.cuda().float() / 255.0
 
-        batch = self.transform_depth_to_xyzmap(batch, H_ori, W_ori, bound=bound)
-        return batch
+        return self.transform_depth_to_xyzmap(batch, H_ori, W_ori)
 
 
 class TripletH5Dataset(PairH5Dataset):
-    def __init__(self, cfg, h5_file, mode, max_num_key=None, cache_data=None):
-        super().__init__(cfg, h5_file, mode, max_num_key, cache_data=cache_data)
+    """HDF5 dataset for loading triplet observation data."""
 
-    def transform_depth_to_xyzmap(self, batch: BatchPoseData, H_ori, W_ori, bound=1):
+    def __init__(self, cfg: dict, h5_file: str, mode: str, max_num_key: int | None = None) -> None:
+        super().__init__(cfg, h5_file, mode, max_num_key)
+
+    def transform_depth_to_xyzmap(self, batch: BatchPoseData, H_ori: int, W_ori: int) -> BatchPoseData:
+        """Transform depth maps to XYZ coordinate maps."""
         bs = len(batch.rgbAs)
         H, W = batch.rgbAs.shape[-2:]
         mesh_radius = batch.mesh_diameters.cuda() / 2
@@ -207,25 +217,28 @@ class TripletH5Dataset(PairH5Dataset):
 
         return batch
 
-    def transform_batch(self, batch: BatchPoseData, H_ori, W_ori, bound=1):
-        bs = len(batch.rgbAs)
+    def transform_batch(self, batch: BatchPoseData, H_ori: int, W_ori: int) -> BatchPoseData:
+        """Transform the batch before feeding to the network."""
         batch.rgbAs = batch.rgbAs.cuda().float() / 255.0
         batch.rgbBs = batch.rgbBs.cuda().float() / 255.0
 
-        batch = self.transform_depth_to_xyzmap(batch, H_ori, W_ori, bound=bound)
-        return batch
+        return self.transform_depth_to_xyzmap(batch, H_ori, W_ori)
 
 
 class ScoreMultiPairH5Dataset(TripletH5Dataset):
-    def __init__(self, cfg, h5_file, mode, max_num_key=None, cache_data=None):
-        super().__init__(cfg, h5_file, mode, max_num_key, cache_data=cache_data)
+    """HDF5 dataset for multi-pair scoring."""
+
+    def __init__(self, cfg: dict, h5_file: str, mode: str, max_num_key: int | None = None) -> None:
+        super().__init__(cfg, h5_file, mode, max_num_key)
         if mode in ["train", "val"]:
             self.cfg["train_num_pair"] = self.n_perturb
 
 
 class PoseRefinePairH5Dataset(PairH5Dataset):
-    def __init__(self, cfg, h5_file, mode="train", max_num_key=None, cache_data=None):
-        super().__init__(cfg=cfg, h5_file=h5_file, mode=mode, max_num_key=max_num_key, cache_data=cache_data)
+    """HDF5 dataset for pose refinement training."""
+
+    def __init__(self, cfg: dict, h5_file: str, mode: str = "train", max_num_key: int | None = None) -> None:
+        super().__init__(cfg=cfg, h5_file=h5_file, mode=mode, max_num_key=max_num_key)
 
         if mode != "test":
             with h5py.File(h5_file, "r", libver="latest") as hf:
@@ -234,22 +247,22 @@ class PoseRefinePairH5Dataset(PairH5Dataset):
                     depthA = imageio.imread(group[key_perturb]["depthA"][()])
                     depthB = imageio.imread(group[key_perturb]["depthB"][()])
                     self.cfg["n_view"] = min(self.cfg["n_view"], depthA.shape[1] // depthB.shape[1])
-                    logging.info(f"n_view:{self.cfg['n_view']}")
+                    logger.debug("n_view:%d", self.cfg["n_view"])
                     self.trans_normalizer = group[key_perturb]["trans_normalizer"][()]
                     if isinstance(self.trans_normalizer, np.ndarray):
                         self.trans_normalizer = self.trans_normalizer.tolist()
                     self.rot_normalizer = group[key_perturb]["rot_normalizer"][()] / 180.0 * np.pi
-                    logging.info(
-                        f"self.trans_normalizer:{self.trans_normalizer}, self.rot_normalizer:{self.rot_normalizer}"
+                    logger.debug(
+                        "self.trans_normalizer:%s, self.rot_normalizer:%s", self.trans_normalizer, self.rot_normalizer
                     )
                     break
 
-    def transform_batch(self, batch: BatchPoseData, H_ori, W_ori, bound=1):
-        """Transform the batch before feeding to the network
-        !NOTE the H_ori, W_ori could be different at test time from the training data, and needs to be set
+    def transform_batch(self, batch: BatchPoseData, H_ori: int, W_ori: int) -> BatchPoseData:
+        """Transform the batch before feeding to the network.
+
+        Note: H_ori, W_ori could be different at test time from training data.
         """
-        bs = len(batch.rgbAs)
         batch.rgbAs = batch.rgbAs.cuda().float() / 255.0
         batch.rgbBs = batch.rgbBs.cuda().float() / 255.0
 
-        return self.transform_depth_to_xyzmap(batch, H_ori, W_ori, bound=bound)
+        return self.transform_depth_to_xyzmap(batch, H_ori, W_ori)

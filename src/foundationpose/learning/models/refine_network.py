@@ -6,6 +6,11 @@
 # distribution of this software and related documentation without an express
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 
+"""Pose refinement network that predicts rotation and translation corrections."""
+
+from __future__ import annotations
+
+from typing import Literal
 
 import torch
 from torch import nn
@@ -14,15 +19,13 @@ from .network_modules import ConvBNReLU, PositionalEmbedding, ResnetBasicBlock
 
 
 class RefineNet(nn.Module):
-    def __init__(self, cfg=None, c_in=4, n_view=1):
+    """Network that refines pose estimates by predicting residual rotation and translation."""
+
+    def __init__(
+        self, use_batch_norm: bool, rotation_representation: Literal["axis_angle", "6d"], c_in: int = 4
+    ) -> None:
         super().__init__()
-        self.cfg = cfg
-        if self.cfg.use_BN:
-            norm_layer = nn.BatchNorm2d
-            norm_layer1d = nn.BatchNorm1d
-        else:
-            norm_layer = None
-            norm_layer1d = None
+        norm_layer = nn.BatchNorm2d if use_batch_norm else None
 
         self.encodeA = nn.Sequential(
             ConvBNReLU(C_in=c_in, C_out=64, kernel_size=7, stride=2, norm_layer=norm_layer),
@@ -48,9 +51,9 @@ class RefineNet(nn.Module):
             nn.Linear(512, 3),
         )
 
-        if self.cfg["rot_rep"] == "axis_angle":
+        if rotation_representation == "axis_angle":
             rot_out_dim = 3
-        elif self.cfg["rot_rep"] == "6d":
+        elif rotation_representation == "6d":
             rot_out_dim = 6
         else:
             raise RuntimeError
@@ -59,8 +62,8 @@ class RefineNet(nn.Module):
             nn.Linear(512, rot_out_dim),
         )
 
-    def forward(self, A, B):
-        """@A: (B,C,H,W)"""
+    def forward(self, A: torch.Tensor, B: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Predict rotation and translation refinements from image pair (B, C, H, W)."""
         bs = len(A)
         output = {}
 
@@ -70,7 +73,7 @@ class RefineNet(nn.Module):
         b = x[bs:]
 
         ab = torch.cat((a, b), 1).contiguous()
-        ab = self.encodeAB(ab)  # (B,C,H,W)
+        ab: torch.Tensor = self.encodeAB(ab)  # (B,C,H,W)
 
         ab = self.pos_embed(ab.reshape(bs, ab.shape[1], -1).permute(0, 2, 1))
 

@@ -71,6 +71,11 @@ convention = "google"
     "F401",   # imported but unused
 ]
 
+"src/foundationpose/**/*.py" = [
+    "N803",   # Argument name should be lowercase - CV domain conventions (rgbA, poseA, H_ori, Ks, etc.)
+    "N815",   # Variable in class scope should not be mixedCase - CV domain conventions
+]
+
 [lint.isort]
 split-on-trailing-comma = false
 

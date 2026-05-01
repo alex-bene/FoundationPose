@@ -6,85 +6,47 @@
 # distribution of this software and related documentation without an express
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 
+"""Utility helpers for rendering, geometry, and depth-map processing."""
 
-import importlib
+from __future__ import annotations
+
 import logging
-import os
-import pdb
-import sys
-from collections import OrderedDict, defaultdict
+from typing import TYPE_CHECKING, Literal, TypeAlias
 
 import cv2
 import numpy as np
 import nvdiffrast.torch as dr
 import open3d as o3d
-import ruamel.yaml
 import scipy
 import torch
 import torch.nn.functional as F
 import torchvision
 import trimesh
 import warp as wp
-from PIL import Image
-from scipy.interpolate import griddata
-from scipy.spatial import cKDTree
-from transformations import euler_matrix
 
-yaml = ruamel.yaml.YAML()
-code_dir = os.path.dirname(os.path.realpath(__file__))
-sys.path.append(code_dir)
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 wp.init()
 
-enable_timer = 0
+logger = logging.getLogger(__name__)
 
+DeviceLike: TypeAlias = str | torch.device
+MeshTensorMap: TypeAlias = dict[str, torch.Tensor]
+ColorBgr: TypeAlias = tuple[int, int, int]
+RasterizeContext: TypeAlias = dr.RasterizeCudaContext | dr.RasterizeGLContext
 
-def NestDict():
-    return defaultdict(NestDict)
-
-
-to8b = lambda x: (255 * np.clip(x, 0, 1)).astype(np.uint8)
-
-BAD_DEPTH = 99
-BAD_COLOR = 0
+DEFAULT_LIGHT_DIR = np.array([0.0, 0.0, 1.0], dtype=float)
+DEFAULT_LIGHT_POS = np.array([0.0, 0.0, 0.0], dtype=float)
 
 glcam_in_cvcam = np.array([[1, 0, 0, 0], [0, -1, 0, 0], [0, 0, -1, 0], [0, 0, 0, 1]]).astype(float)
 
-COLOR_MAP = np.array(
-    [
-        [0, 0, 0],  # Ignore
-        [128, 0, 0],  # Background
-        [0, 128, 0],  # Wall
-        [128, 128, 0],  # Floor
-        [0, 0, 128],  # Ceiling
-        [128, 0, 128],  # Table
-        [0, 128, 128],  # Chair
-        [128, 128, 128],  # Window
-        [64, 0, 0],  # Door
-        [192, 0, 0],  # Monitor
-        [64, 128, 0],  # 11th
-        [192, 0, 128],
-        [64, 128, 128],
-        [192, 128, 128],
-        [0, 64, 0],
-        [128, 64, 0],
-        [0, 192, 0],
-        [128, 192, 0],
-    ]
-)
 
-
-def set_logging_format(level=logging.INFO):
-    importlib.reload(logging)
-    FORMAT = "[%(funcName)s()] %(message)s"
-    logging.basicConfig(level=level, format=FORMAT)
-
-
-set_logging_format()
-
-
-def make_mesh_tensors(mesh, device="cuda", max_tex_size=None):
-    mesh_tensors = {}
+def make_mesh_tensors(
+    mesh: trimesh.Trimesh, device: DeviceLike = "cuda", max_tex_size: int | None = None
+) -> MeshTensorMap:
+    """Convert a trimesh mesh into tensor buffers suitable for rendering."""
+    mesh_tensors: MeshTensorMap = {}
     if isinstance(mesh.visual, trimesh.visual.texture.TextureVisuals):
         img = np.array(mesh.visual.material.image.convert("RGB"))
         img = img[..., :3]
@@ -100,7 +62,7 @@ def make_mesh_tensors(mesh, device="cuda", max_tex_size=None):
         mesh_tensors["uv"] = uv
     else:
         if mesh.visual.vertex_colors is None:
-            logging.info("WARN: mesh doesn't have vertex_colors, assigning a pure color")
+            logger.warning("mesh doesn't have vertex_colors, assigning a pure color")
             mesh.visual.vertex_colors = np.tile(np.array([128, 128, 128]).reshape(1, 3), (len(mesh.vertices), 1))
         mesh_tensors["vertex_color"] = (
             torch.as_tensor(mesh.visual.vertex_colors[..., :3], device=device, dtype=torch.float) / 255.0
@@ -116,35 +78,49 @@ def make_mesh_tensors(mesh, device="cuda", max_tex_size=None):
     return mesh_tensors
 
 
-def nvdiffrast_render(
-    K=None,
-    H=None,
-    W=None,
-    ob_in_cams=None,
-    glctx=None,
-    context="cuda",
-    get_normal=False,
-    mesh_tensors=None,
-    mesh=None,
-    projection_mat=None,
-    bbox2d=None,
-    output_size=None,
-    use_light=False,
-    light_color=None,
-    light_dir=np.array([0, 0, 1]),
-    light_pos=np.array([0, 0, 0]),
-    w_ambient=0.8,
-    w_diffuse=0.5,
-    extra={},
-):
-    """Just plain rendering, not support any gradient
-    @K: (3,3) np array
-    @ob_in_cams: (N,4,4) torch tensor, openCV camera
-    @projection_mat: np array (4,4)
-    @output_size: (height, width)
-    @bbox2d: (N,4) (umin,vmin,umax,vmax) if only roi need to render.
-    @light_dir: in cam space
-    @light_pos: in cam space
+def nvdiffrast_render(  # noqa: PLR0912, PLR0915
+    ob_in_cams: torch.Tensor,
+    K: np.ndarray | None = None,
+    H: int | None = None,
+    W: int | None = None,
+    glctx: RasterizeContext | None = None,
+    context: Literal["cuda", "gl"] = "cuda",
+    get_normal: bool = False,
+    mesh_tensors: MeshTensorMap | None = None,
+    mesh: trimesh.Trimesh | None = None,
+    projection_mat: np.ndarray | None = None,
+    bbox2d: torch.Tensor | None = None,
+    output_size: Sequence[int] | np.ndarray | None = None,
+    use_light: bool = False,
+    light_color: np.ndarray | torch.Tensor | None = None,
+    light_dir: np.ndarray | None = None,
+    light_pos: np.ndarray | None = None,
+    w_ambient: float = 0.8,
+    w_diffuse: float = 0.5,
+    extra: dict[str, torch.Tensor] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """Render a mesh with nvdiffrast without gradient support.
+
+    Args:
+        K: Camera intrinsics with shape `(3, 3)`.
+        H: Output image height.
+        W: Output image width.
+        ob_in_cams: Object poses in OpenCV camera coordinates with shape `(N, 4, 4)`.
+        glctx: Optional pre-created rasterization context.
+        context: Backend used when creating a rasterization context.
+        get_normal: Whether to return an interpolated normal map.
+        mesh_tensors: Optional prebuilt mesh tensor buffers.
+        mesh: Mesh source used when `mesh_tensors` is not provided.
+        projection_mat: Optional OpenGL projection matrix with shape `(4, 4)`.
+        output_size: Optional `(height, width)` render size override.
+        use_light: Whether to apply a simple diffuse lighting model.
+        light_color: Optional RGB light color.
+        bbox2d: Optional per-pose ROI boxes as `(umin, vmin, umax, vmax)`.
+        light_dir: Optional light direction in camera space.
+        light_pos: Optional light position in camera space.
+        w_ambient: Ambient lighting weight.
+        w_diffuse: Diffuse lighting weight.
+        extra: Output dictionary populated with auxiliary tensors.
     """
     if glctx is None:
         if context == "gl":
@@ -153,36 +129,60 @@ def nvdiffrast_render(
             glctx = dr.RasterizeCudaContext()
         else:
             raise NotImplementedError
-        logging.info("created context")
+        logger.debug("created context")
 
     if mesh_tensors is None:
+        if mesh is None:
+            msg = "`mesh` is required when `mesh_tensors` is not provided."
+            raise ValueError(msg)
         mesh_tensors = make_mesh_tensors(mesh)
     pos = mesh_tensors["pos"]
     vnormals = mesh_tensors["vnormals"]
     pos_idx = mesh_tensors["faces"]
     has_tex = "tex" in mesh_tensors
+    render_device = ob_in_cams.device
 
-    ob_in_glcams = torch.tensor(glcam_in_cvcam, device="cuda", dtype=torch.float)[None] @ ob_in_cams
     if projection_mat is None:
+        if K is None or H is None or W is None:
+            msg = "`K`, `H`, and `W` are required when `projection_mat` is not provided."
+            raise ValueError(msg)
         projection_mat = projection_matrix_from_intrinsics(K, height=H, width=W, znear=0.001, zfar=100)
-    projection_mat = torch.as_tensor(projection_mat.reshape(-1, 4, 4), device="cuda", dtype=torch.float)
-    mtx = projection_mat @ ob_in_glcams
-
     if output_size is None:
+        if H is None or W is None:
+            msg = "`H` and `W` are required when `output_size` is not provided."
+            raise ValueError(msg)
         output_size = np.asarray([H, W])
+    if light_dir is None:
+        light_dir = DEFAULT_LIGHT_DIR
+    if light_pos is None:
+        light_pos = DEFAULT_LIGHT_POS
+    if extra is None:
+        extra = {}
+
+    ob_in_glcams = torch.as_tensor(glcam_in_cvcam, device=render_device, dtype=torch.float)[None] @ ob_in_cams
+    projection_mat = torch.as_tensor(projection_mat.reshape(-1, 4, 4), device=render_device, dtype=torch.float)
+    mtx = projection_mat @ ob_in_glcams
 
     pts_cam = transform_pts(pos, ob_in_cams)
     pos_homo = to_homo_torch(pos)
     pos_clip = (mtx[:, None] @ pos_homo[None, ..., None])[..., 0]
     if bbox2d is not None:
-        l = bbox2d[:, 0]
+        if H is None or W is None:
+            msg = "`H` and `W` are required when `bbox2d` is provided."
+            raise ValueError(msg)
+        left = bbox2d[:, 0]
         t = H - bbox2d[:, 1]
         r = bbox2d[:, 2]
         b = H - bbox2d[:, 3]
-        tf = torch.eye(4, dtype=torch.float, device="cuda").reshape(1, 4, 4).expand(len(ob_in_cams), 4, 4).contiguous()
-        tf[:, 0, 0] = W / (r - l)
+        tf = (
+            torch.eye(4, dtype=torch.float, device=render_device)
+            .reshape(1, 4, 4)
+            .expand(len(ob_in_cams), 4, 4)
+            .contiguous()
+        )
+        tf[:, 0, 0] = W / (r - left)
         tf[:, 1, 1] = H / (t - b)
-        tf[:, 3, 0] = (W - r - l) / (r - l)
+        tf[:, 3, 0] = (W - r - left) / (r - left)
         tf[:, 3, 1] = (H - t - b) / (t - b)
         pos_clip = pos_clip @ tf
     rast_out, _ = dr.rasterize(glctx, pos_clip, pos_idx, resolution=np.asarray(output_size))
@@ -206,17 +206,18 @@ def nvdiffrast_render(
 
     if use_light:
         if light_dir is not None:
-            light_dir_neg = -torch.as_tensor(light_dir, dtype=torch.float, device="cuda")
+            light_dir_neg = -torch.as_tensor(light_dir, dtype=torch.float, device=render_device)
         else:
-            light_dir_neg = torch.as_tensor(light_pos, dtype=torch.float, device="cuda").reshape(1, 1, 3) - pts_cam
+            light_dir_neg = (
+                torch.as_tensor(light_pos, dtype=torch.float, device=render_device).reshape(1, 1, 3) - pts_cam
+            )
         diffuse_intensity = (
             (F.normalize(vnormals_cam, dim=-1) * F.normalize(light_dir_neg, dim=-1)).sum(dim=-1).clip(0, 1)[..., None]
         )
         diffuse_intensity_map, _ = dr.interpolate(diffuse_intensity, rast_out, pos_idx)  # (N_pose, H, W, 1)
-        if light_color is None:
-            light_color = color
-        else:
-            light_color = torch.as_tensor(light_color, device="cuda", dtype=torch.float)
+        light_color = (
+            color if light_color is None else torch.as_tensor(light_color, device=render_device, dtype=torch.float)
+        )
         color = color * w_ambient + diffuse_intensity_map * light_color * w_diffuse
 
     color = color.clip(0, 1)
@@ -227,66 +228,10 @@ def nvdiffrast_render(
     return color, depth, normal_map
 
 
-def set_seed(random_seed):
-    import random
-
-    import torch
-
-    np.random.seed(random_seed)
-    random.seed(random_seed)
-    torch.manual_seed(random_seed)
-    torch.cuda.manual_seed_all(random_seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-
-
-def add_err(pred, gt, model_pts, symetry_tfs=np.eye(4)[None]):
-    """Average Distance of Model Points for objects with no indistinguishable views
-    - by Hinterstoisser et al. (ACCV 2012).
-    """
-    pred_pts = transform_pts(model_pts, pred)
-    gt_pts = transform_pts(model_pts, gt)
-    e = np.linalg.norm(pred_pts - gt_pts, axis=-1).mean()
-    return e
-
-
-def adds_err(pred, gt, model_pts):
-    """@pred: 4x4 mat
-    @gt:
-    @model: (N,3)
-    """
-    pred_pts = transform_pts(model_pts, pred)
-    gt_pts = transform_pts(model_pts, gt)
-    nn_index = cKDTree(pred_pts)
-    nn_dists, _ = nn_index.query(gt_pts, k=1, workers=-1)
-    e = nn_dists.mean()
-    return e
-
-
-def compute_auc_sklearn(errs, max_val=0.1, step=0.001):
-    from sklearn import metrics
-
-    errs = np.sort(np.array(errs))
-    X = np.arange(0, max_val + step, step)
-    Y = np.ones(len(X))
-    for i, x in enumerate(X):
-        y = (errs <= x).sum() / len(errs)
-        Y[i] = y
-        if y >= 1:
-            break
-    auc = metrics.auc(X, Y) / (max_val * 1)
-    return auc
-
-
-def normalizeRotation(pose):
-    """Assume no shear case"""
-    new_pose = pose.copy()
-    scales = np.linalg.norm(pose[:3, :3], axis=0)
-    new_pose[:3, :3] /= scales.reshape(1, 3)
-    return new_pose
-
-
-def toOpen3dCloud(points, colors=None, normals=None):
+def to_open3d_cloud(
+    points: np.ndarray, colors: np.ndarray | None = None, normals: np.ndarray | None = None
+) -> o3d.geometry.PointCloud:
+    """Build an Open3D point cloud from point, color, and normal arrays."""
     cloud = o3d.geometry.PointCloud()
     cloud.points = o3d.utility.Vector3dVector(points.astype(np.float64))
     if colors is not None:
@@ -298,28 +243,28 @@ def toOpen3dCloud(points, colors=None, normals=None):
     return cloud
 
 
-def make_grid_image(imgs, nrow, padding=5, pad_value=255):
-    """@imgs: (B,H,W,C) np array
-    @nrow: num of images per row
-    """
+def make_grid_image(
+    imgs: Sequence[np.ndarray] | np.ndarray, nrow: int, padding: int = 5, pad_value: int = 255
+) -> np.ndarray:
+    """Create a tiled image grid from a batch of RGB images."""
     grid = torchvision.utils.make_grid(
         torch.as_tensor(np.asarray(imgs)).permute(0, 3, 1, 2), nrow=nrow, padding=padding, pad_value=pad_value
     )
-    grid = grid.permute(1, 2, 0).contiguous().data.cpu().numpy().astype(np.uint8)
-    return grid
+    return grid.permute(1, 2, 0).contiguous().data.cpu().numpy().astype(np.uint8)
 
 
 if wp is not None:
 
     @wp.kernel(enable_backward=False)
-    def bilateral_filter_depth_kernel(
-        depth: wp.array(dtype=float, ndim=2),
-        out: wp.array(dtype=float, ndim=2),
+    def bilateral_filter_depth_kernel(  # noqa: PLR0912
+        depth: wp.array(dtype=float, ndim=2),  # pyright: ignore reportInvalidType
+        out: wp.array(dtype=float, ndim=2),  # pyright: ignore reportInvalidType
         radius: int,
         zfar: float,
         sigmaD: float,
         sigmaR: float,
-    ):
+    ) -> None:
+        """Warp kernel for bilateral filtering a depth map."""
         h, w = wp.tid()
         H = depth.shape[0]
         W = depth.shape[1]
@@ -344,7 +289,7 @@ if wp is not None:
 
         depthCenter = depth[h, w]
         sum_weight = 0.0
-        sum = 0.0
+        depth_sum = 0.0
         for u in range(w - radius, w + radius + 1):
             if u < 0 or u >= W:
                 continue
@@ -358,11 +303,19 @@ if wp is not None:
                         - (depthCenter - cur_depth) * (depthCenter - cur_depth) / (2.0 * sigmaR * sigmaR)
                     )
                     sum_weight += weight
-                    sum += weight * cur_depth
+                    depth_sum += weight * cur_depth
         if sum_weight > 0 and num_valid > 0:
-            out[h, w] = sum / sum_weight
+            out[h, w] = depth_sum / sum_weight
 
-    def bilateral_filter_depth(depth, radius=2, zfar=100, sigmaD=2, sigmaR=100000, device="cuda"):
+    def bilateral_filter_depth(
+        depth: np.ndarray | torch.Tensor,
+        radius: int = 2,
+        zfar: float = 100,
+        sigmaD: float = 2,
+        sigmaR: float = 100000,
+        device: DeviceLike = "cuda",
+    ) -> np.ndarray | torch.Tensor:
+        """Apply a bilateral filter to a depth map using Warp."""
         if isinstance(depth, np.ndarray):
             depth_wp = wp.array(depth, dtype=float, device=device)
         else:
@@ -382,13 +335,14 @@ if wp is not None:
 
     @wp.kernel(enable_backward=False)
     def erode_depth_kernel(
-        depth: wp.array(dtype=float, ndim=2),
-        out: wp.array(dtype=float, ndim=2),
+        depth: wp.array(dtype=float, ndim=2),  # pyright: ignore reportInvalidType
+        out: wp.array(dtype=float, ndim=2),  # pyright: ignore reportInvalidType
         radius: int,
         depth_diff_thres: float,
         ratio_thres: float,
         zfar: float,
-    ):
+    ) -> None:
+        """Warp kernel that erodes depth discontinuities."""
         h, w = wp.tid()
         H = depth.shape[0]
         W = depth.shape[1]
@@ -414,7 +368,15 @@ if wp is not None:
         else:
             out[h, w] = d_ori
 
-    def erode_depth(depth, radius=2, depth_diff_thres=0.001, ratio_thres=0.8, zfar=100, device="cuda"):
+    def erode_depth(
+        depth: np.ndarray | torch.Tensor,
+        radius: int = 2,
+        depth_diff_thres: float = 0.001,
+        ratio_thres: float = 0.8,
+        zfar: float = 100,
+        device: DeviceLike = "cuda",
+    ) -> np.ndarray | torch.Tensor:
+        """Erode unstable depth pixels using local agreement."""
         depth_wp = wp.from_torch(torch.as_tensor(depth, dtype=torch.float, device=device))
         out_wp = wp.zeros(depth.shape, dtype=float, device=device)
         wp.launch(
@@ -430,7 +392,8 @@ if wp is not None:
         return depth_out
 
 
-def depth2xyzmap(depth, K, uvs=None):
+def depth2xyzmap(depth: np.ndarray, K: np.ndarray, uvs: np.ndarray | None = None) -> np.ndarray:
+    """Project a depth map into an XYZ map using camera intrinsics."""
     invalid_mask = depth < 0.001
     H, W = depth.shape[:2]
     if uvs is None:
@@ -451,16 +414,16 @@ def depth2xyzmap(depth, K, uvs=None):
     return xyz_map
 
 
-def depth2xyzmap_batch(depths, Ks, zfar):
-    """@depths: torch tensor (B,H,W)
-    @Ks: torch tensor (B,3,3)
-    """
+def depth2xyzmap_batch(depths: torch.Tensor, Ks: torch.Tensor, zfar: float) -> torch.Tensor:
+    """Project a batch of depth maps into XYZ maps."""
     bs = depths.shape[0]
     invalid_mask = (depths < 0.001) | (depths > zfar)
     H, W = depths.shape[-2:]
-    vs, us = torch.meshgrid(torch.arange(0, H), torch.arange(0, W), indexing="ij")
-    vs = vs.reshape(-1).float().cuda()[None].expand(bs, -1)
-    us = us.reshape(-1).float().cuda()[None].expand(bs, -1)
+    vs, us = torch.meshgrid(
+        torch.arange(0, H, device=depths.device), torch.arange(0, W, device=depths.device), indexing="ij"
+    )
+    vs = vs.reshape(-1).float()[None].expand(bs, -1)
+    us = us.reshape(-1).float()[None].expand(bs, -1)
     zs = depths.reshape(bs, -1)
     Ks = Ks[:, None].expand(bs, zs.shape[-1], 3, 3)
     xs = (us - Ks[..., 0, 2]) * zs / Ks[..., 0, 0]  # (B,N)
@@ -471,21 +434,14 @@ def depth2xyzmap_batch(depths, Ks, zfar):
     return xyz_maps
 
 
-def rle_to_mask(rle: dict) -> np.ndarray:
-    """Compute a binary mask from an uncompressed RLE."""
-    h, w = rle["size"]
-    mask = np.empty(h * w, dtype=bool)
-    idx = 0
-    parity = False
-    for count in rle["counts"]:
-        mask[idx : idx + count] = parity
-        idx += count
-        parity ^= True
-    mask = mask.reshape(w, h)
-    return mask.transpose()  # Put in C order
-
-
-def depth_to_vis(depth, zmin=None, zmax=None, mode="rgb", inverse=True):
+def depth_to_vis(
+    depth: np.ndarray,
+    zmin: float | None = None,
+    zmax: float | None = None,
+    mode: Literal["gray", "rgb"] = "rgb",
+    inverse: bool = True,
+) -> np.ndarray:
+    """Convert a depth map into a visualizable grayscale or RGB image."""
     if zmin is None:
         zmin = depth.min()
     if zmax is None:
@@ -511,7 +467,8 @@ def depth_to_vis(depth, zmin=None, zmax=None, mode="rgb", inverse=True):
     return vis
 
 
-def sample_views_icosphere(n_views, subdivisions=None, radius=1):
+def sample_views_icosphere(n_views: int, subdivisions: int | None = None, radius: float = 1) -> np.ndarray:
+    """Sample camera poses from an icosphere."""
     if subdivisions is not None:
         mesh = trimesh.creation.icosphere(subdivisions=subdivisions, radius=radius)
     else:
@@ -538,141 +495,130 @@ def sample_views_icosphere(n_views, subdivisions=None, radius=1):
     return cam_in_obs
 
 
-def to_homo(pts):
-    """@pts: (N,3 or 2) will homogeneliaze the last dimension"""
-    assert len(pts.shape) == 2, f"pts.shape: {pts.shape}"
-    homo = np.concatenate((pts, np.ones((pts.shape[0], 1))), axis=-1)
-    return homo
-
-
-def to_homo_torch(pts):
-    """@pts: shape can be (...,N,3 or 2) or (N,3) will homogeneliaze the last dimension"""
+def to_homo_torch(pts: torch.Tensor) -> torch.Tensor:
+    """Append a homogeneous coordinate to the last dimension of a tensor."""
     ones = torch.ones((*pts.shape[:-1], 1), dtype=torch.float, device=pts.device)
-    homo = torch.cat((pts, ones), dim=-1)
-    return homo
+    return torch.cat((pts, ones), dim=-1)
 
 
-def transform_pts(pts, tf):
-    """Transform 2d or 3d points
-    @pts: (...,N_pts,3)
-    @tf: (...,4,4)
-    """
+def transform_pts(pts: torch.Tensor, tf: torch.Tensor) -> torch.Tensor:
+    """Transform 2D or 3D points with a homogeneous transform."""
     if len(tf.shape) >= 3 and tf.shape[-3] != pts.shape[-2]:
         tf = tf[..., None, :, :]
     return (tf[..., :-1, :-1] @ pts[..., None] + tf[..., :-1, -1:])[..., 0]
 
 
-def transform_dirs(dirs, tf):
-    """@dirs: (...,3)
-    @tf: (...,4,4)
-    """
+def transform_dirs(dirs: torch.Tensor, tf: torch.Tensor) -> torch.Tensor:
+    """Rotate direction vectors using the linear part of a transform."""
     if len(tf.shape) >= 3 and tf.shape[-3] != dirs.shape[-2]:
         tf = tf[..., None, :, :]
     return (tf[..., :3, :3] @ dirs[..., None])[..., 0]
 
 
-def random_direction():
-    """https://stackoverflow.com/questions/33976911/generate-a-random-sample-of-points-distributed-on-the-surface-of-a-unit-sphere"""
-    vec = np.random.randn(3).reshape(3)
-    vec /= np.linalg.norm(vec)
-    return vec
-
-
-def compute_mesh_diameter(model_pts=None, mesh=None, n_sample=1000):
+def compute_mesh_diameter(
+    model_pts: np.ndarray | None = None, mesh: trimesh.Trimesh | None = None, n_sample: int | None = 1000
+) -> float:
+    """Estimate a mesh or point cloud diameter."""
     if mesh is not None:
-        u, s, vh = scipy.linalg.svd(mesh.vertices, full_matrices=False)
+        u, s, _ = scipy.linalg.svd(mesh.vertices, full_matrices=False)
         pts = u @ s
         diameter = np.linalg.norm(pts.max(axis=0) - pts.min(axis=0))
         return float(diameter)
 
+    if model_pts is None:
+        msg = "`model_pts` is required when `mesh` is not provided."
+        raise ValueError(msg)
     if n_sample is None:
         pts = model_pts
     else:
-        ids = np.random.choice(len(model_pts), size=min(n_sample, len(model_pts)), replace=False)
+        rng = np.random.default_rng()
+        ids = rng.choice(len(model_pts), size=min(n_sample, len(model_pts)), replace=False)
         pts = model_pts[ids]
     dists = np.linalg.norm(pts[None] - pts[:, None], axis=-1)
-    diameter = dists.max()
-    return diameter
+    return float(dists.max())
 
 
 def compute_crop_window_tf_batch(
-    pts=None,
-    H=None,
-    W=None,
-    poses=None,
-    K=None,
-    crop_ratio=1.2,
-    out_size=None,
-    rgb=None,
-    uvs=None,
-    method="min_box",
-    mesh_diameter=None,
-):
-    """Project the points and find the cropping transform
-    @pts: (N,3)
-    @poses: (B,4,4) tensor
-    @min_box: min_box/min_circle
-    @scale: scale to apply to the tightly enclosing roi
-    """
+    pts: torch.Tensor | None = None,
+    poses: torch.Tensor | None = None,
+    K: np.ndarray | torch.Tensor | None = None,
+    crop_ratio: float = 1.2,
+    out_size: Sequence[int] | torch.Tensor | np.ndarray | None = None,
+    method: str = "min_box",
+    mesh_diameter: float | None = None,
+) -> torch.Tensor:
+    """Compute crop transforms for a batch of object poses."""
 
-    def compute_tf_batch(left, right, top, bottom):
+    def compute_tf_batch(
+        left: torch.Tensor, right: torch.Tensor, top: torch.Tensor, bottom: torch.Tensor
+    ) -> torch.Tensor:
         B = len(left)
         left = left.round()
         right = right.round()
         top = top.round()
         bottom = bottom.round()
 
-        tf = torch.eye(3)[None].expand(B, -1, -1).contiguous()
+        if out_size is None:
+            msg = "`out_size` is required."
+            raise ValueError(msg)
+        tf = torch.eye(3, device=left.device, dtype=left.dtype)[None].expand(B, -1, -1).contiguous()
         tf[:, 0, 2] = -left
         tf[:, 1, 2] = -top
-        new_tf = torch.eye(3)[None].expand(B, -1, -1).contiguous()
+        new_tf = torch.eye(3, device=left.device, dtype=left.dtype)[None].expand(B, -1, -1).contiguous()
         new_tf[:, 0, 0] = out_size[0] / (right - left)
         new_tf[:, 1, 1] = out_size[1] / (bottom - top)
-        tf = new_tf @ tf
-        return tf
+        return new_tf @ tf
 
+    if poses is None or K is None:
+        msg = "`poses` and `K` are required."
+        raise ValueError(msg)
     B = len(poses)
-    torch.set_default_tensor_type("torch.cuda.FloatTensor")
-    if method == "box_3d":
-        radius = mesh_diameter * crop_ratio / 2
-        offsets = torch.tensor([0, 0, 0, radius, 0, 0, -radius, 0, 0, 0, radius, 0, 0, -radius, 0]).reshape(-1, 3)
-        pts = poses[:, :3, 3].reshape(-1, 1, 3) + offsets.reshape(1, -1, 3)
-        K = torch.as_tensor(K)
-        projected = (K @ pts.reshape(-1, 3).T).T
-        uvs = projected[:, :2] / projected[:, 2:3]
-        uvs = uvs.reshape(B, -1, 2)
-        center = uvs[:, 0]  # (B,2)
-        radius = torch.abs(uvs - center.reshape(-1, 1, 2)).reshape(B, -1).max(axis=-1)[0].reshape(-1)  # (B)
-        left = center[:, 0] - radius
-        right = center[:, 0] + radius
-        top = center[:, 1] - radius
-        bottom = center[:, 1] + radius
-        tfs = compute_tf_batch(left, right, top, bottom)
-        return tfs
+    if method != "box_3d":
+        msg_0 = f"Unknown method: {method}"
+        raise RuntimeError(msg_0)
 
-    raise RuntimeError
-
-    return tf
+    if mesh_diameter is None:
+        msg = "`mesh_diameter` is required for `box_3d` crops."
+        raise ValueError(msg)
+    radius = mesh_diameter * crop_ratio / 2
+    offsets = torch.tensor(
+        [0, 0, 0, radius, 0, 0, -radius, 0, 0, 0, radius, 0, 0, -radius, 0], device=poses.device, dtype=poses.dtype
+    ).reshape(-1, 3)
+    pts = poses[:, :3, 3].reshape(-1, 1, 3) + offsets.reshape(1, -1, 3)
+    K = torch.as_tensor(K, device=poses.device, dtype=poses.dtype)
+    projected = (K @ pts.reshape(-1, 3).T).T
+    uvs = projected[:, :2] / projected[:, 2:3]
+    uvs = uvs.reshape(B, -1, 2)
+    center = uvs[:, 0]  # (B,2)
+    radius = torch.abs(uvs - center.reshape(-1, 1, 2)).reshape(B, -1).max(axis=-1)[0].reshape(-1)  # (B)
+    left = center[:, 0] - radius
+    right = center[:, 0] + radius
+    top = center[:, 1] - radius
+    bottom = center[:, 1] + radius
+    return compute_tf_batch(left, right, top, bottom)
 
 
 def cv_draw_text(
-    img,
-    text,
-    uv_top_left,
-    color=(255, 255, 255),
-    fontScale=0.5,
-    thickness=1,
-    fontFace=cv2.FONT_HERSHEY_SIMPLEX,
-    outline_color=None,
-    line_spacing=1.5,
-):
+    img: np.ndarray,
+    text: str,
+    uv_top_left: Sequence[float],
+    color: ColorBgr = (255, 255, 255),
+    fontScale: float = 0.5,
+    thickness: int = 1,
+    fontFace: int = cv2.FONT_HERSHEY_SIMPLEX,
+    outline_color: ColorBgr | None = None,
+    line_spacing: float = 1.5,
+) -> np.ndarray:
+    """Draw multiline text while keeping the text box inside the image."""
     H, W = img.shape[:2]
     uv_top_left = np.array(uv_top_left, dtype=float)
-    assert uv_top_left.shape == (2,)
+    if uv_top_left.shape != (2,):
+        msg = "`uv_top_left` must contain exactly two coordinates."
+        raise ValueError(msg)
 
     for line in text.splitlines():
         (w, h), _ = cv2.getTextSize(text=line, fontFace=fontFace, fontScale=fontScale, thickness=thickness)
-        uv_bottom_left_i = uv_top_left + [0, h]
+        uv_bottom_left_i = uv_top_left + np.array([0.0, float(h)])
 
         ############# Ensure inside image
         while uv_bottom_left_i[0] < 0:
@@ -711,103 +657,14 @@ def cv_draw_text(
     return img
 
 
-def trimesh_add_pure_colored_texture(mesh, color=np.array([255, 255, 255]), resolution=5):
-    tex_img = np.tile(color.reshape(1, 1, 3), (resolution, resolution, 1)).astype(np.uint8)
-    mesh = mesh.unwrap()
-    mesh.visual = trimesh.visual.texture.TextureVisuals(uv=mesh.visual.uv, image=Image.fromarray(tex_img))
-    return mesh
-
-
-def project_3d_to_2d(pt, K, ob_in_cam):
-    pt = pt.reshape(4, 1)
-    projected = K @ ((ob_in_cam @ pt)[:3, :])
-    projected = projected.reshape(-1)
-    projected = projected / projected[2]
-    return projected.reshape(-1)[:2].round().astype(int)
-
-
-def draw_xyz_axis(color, ob_in_cam, scale=0.1, K=np.eye(3), thickness=3, transparency=0, is_input_rgb=False):
-    """@color: BGR"""
-    if is_input_rgb:
-        color = cv2.cvtColor(color, cv2.COLOR_RGB2BGR)
-    xx = np.array([1, 0, 0, 1]).astype(float)
-    yy = np.array([0, 1, 0, 1]).astype(float)
-    zz = np.array([0, 0, 1, 1]).astype(float)
-    xx[:3] = xx[:3] * scale
-    yy[:3] = yy[:3] * scale
-    zz[:3] = zz[:3] * scale
-    origin = tuple(project_3d_to_2d(np.array([0, 0, 0, 1]), K, ob_in_cam))
-    xx = tuple(project_3d_to_2d(xx, K, ob_in_cam))
-    yy = tuple(project_3d_to_2d(yy, K, ob_in_cam))
-    zz = tuple(project_3d_to_2d(zz, K, ob_in_cam))
-    line_type = cv2.LINE_AA
-    arrow_len = 0
-    tmp = color.copy()
-    tmp1 = tmp.copy()
-    tmp1 = cv2.arrowedLine(
-        tmp1, origin, xx, color=(0, 0, 255), thickness=thickness, line_type=line_type, tipLength=arrow_len
-    )
-    mask = np.linalg.norm(tmp1 - tmp, axis=-1) > 0
-    tmp[mask] = tmp[mask] * transparency + tmp1[mask] * (1 - transparency)
-    tmp1 = tmp.copy()
-    tmp1 = cv2.arrowedLine(
-        tmp1, origin, yy, color=(0, 255, 0), thickness=thickness, line_type=line_type, tipLength=arrow_len
-    )
-    mask = np.linalg.norm(tmp1 - tmp, axis=-1) > 0
-    tmp[mask] = tmp[mask] * transparency + tmp1[mask] * (1 - transparency)
-    tmp1 = tmp.copy()
-    tmp1 = cv2.arrowedLine(
-        tmp1, origin, zz, color=(255, 0, 0), thickness=thickness, line_type=line_type, tipLength=arrow_len
-    )
-    mask = np.linalg.norm(tmp1 - tmp, axis=-1) > 0
-    tmp[mask] = tmp[mask] * transparency + tmp1[mask] * (1 - transparency)
-    tmp = tmp.astype(np.uint8)
-    if is_input_rgb:
-        tmp = cv2.cvtColor(tmp, cv2.COLOR_BGR2RGB)
-
-    return tmp
-
-
-def draw_posed_3d_box(K, img, ob_in_cam, bbox, line_color=(0, 255, 0), linewidth=2):
-    """Revised from 6pack dataset/inference_dataset_nocs.py::projection
-    @bbox: (2,3) min/max
-    @line_color: RGB
-    """
-    min_xyz = bbox.min(axis=0)
-    xmin, ymin, zmin = min_xyz
-    max_xyz = bbox.max(axis=0)
-    xmax, ymax, zmax = max_xyz
-
-    def draw_line3d(start, end, img):
-        pts = np.stack((start, end), axis=0).reshape(-1, 3)
-        pts = (ob_in_cam @ to_homo(pts).T).T[:, :3]  # (2,3)
-        projected = (K @ pts.T).T
-        uv = np.round(projected[:, :2] / projected[:, 2].reshape(-1, 1)).astype(int)  # (2,2)
-        img = cv2.line(img, uv[0].tolist(), uv[1].tolist(), color=line_color, thickness=linewidth, lineType=cv2.LINE_AA)
-        return img
-
-    for y in [ymin, ymax]:
-        for z in [zmin, zmax]:
-            start = np.array([xmin, y, z])
-            end = start + np.array([xmax - xmin, 0, 0])
-            img = draw_line3d(start, end, img)
-
-    for x in [xmin, xmax]:
-        for z in [zmin, zmax]:
-            start = np.array([x, ymin, z])
-            end = start + np.array([0, ymax - ymin, 0])
-            img = draw_line3d(start, end, img)
-
-    for x in [xmin, xmax]:
-        for y in [ymin, ymax]:
-            start = np.array([x, y, zmin])
-            end = start + np.array([0, 0, zmax - zmin])
-            img = draw_line3d(start, end, img)
-
-    return img
-
-
-def projection_matrix_from_intrinsics(K, height, width, znear, zfar, window_coords="y_down"):
+def projection_matrix_from_intrinsics(
+    K: np.ndarray,
+    height: int,
+    width: int,
+    znear: float,
+    zfar: float,
+    window_coords: Literal["y_up", "y_down"] = "y_down",
+) -> np.ndarray:
     """Conversion of Hartley-Zisserman intrinsic matrix to OpenGL proj. matrix.
 
     Ref:
@@ -864,234 +721,53 @@ def projection_matrix_from_intrinsics(K, height, width, znear, zfar, window_coor
     return proj
 
 
-def symmetry_tfs_from_info(info, rot_angle_discrete=5):
-    symmetry_tfs = [np.eye(4)]
-    if "symmetries_discrete" in info:
-        tfs = np.array(info["symmetries_discrete"]).reshape(-1, 4, 4)
-        tfs[..., :3, 3] *= 0.001
-        symmetry_tfs = [np.eye(4)]
-        symmetry_tfs += list(tfs)
-    if "symmetries_continuous" in info:
-        axis = np.array(info["symmetries_continuous"][0]["axis"]).reshape(3)
-        offset = info["symmetries_continuous"][0]["offset"]
-        rxs = [0]
-        rys = [0]
-        rzs = [0]
-        if axis[0] > 0:
-            rxs = np.arange(0, 360, rot_angle_discrete) / 180.0 * np.pi
-        elif axis[1] > 0:
-            rys = np.arange(0, 360, rot_angle_discrete) / 180.0 * np.pi
-        elif axis[2] > 0:
-            rzs = np.arange(0, 360, rot_angle_discrete) / 180.0 * np.pi
-        for rx in rxs:
-            for ry in rys:
-                for rz in rzs:
-                    tf = euler_matrix(rx, ry, rz)
-                    tf[:3, 3] = offset
-                    symmetry_tfs.append(tf)
-    if len(symmetry_tfs) == 0:
-        symmetry_tfs = [np.eye(4)]
-    symmetry_tfs = np.array(symmetry_tfs)
-    return symmetry_tfs
-
-
-def pose_to_egocentric_delta_pose(A_in_cam, B_in_cam):
-    """Used for Pose Refinement. Given the object's two poses in camera, convert them to relative poses in camera's egocentric view
-    @A_in_cam: (B,4,4) torch tensor
-    """
-    trans_delta = B_in_cam[:, :3, 3] - A_in_cam[:, :3, 3]
-    rot_mat_delta = B_in_cam[:, :3, :3] @ A_in_cam[:, :3, :3].permute(0, 2, 1)
-    return trans_delta, rot_mat_delta
-
-
-def egocentric_delta_pose_to_pose(A_in_cam, trans_delta, rot_mat_delta):
-    """Used for Pose Refinement. Given the object's two poses in camera, convert them to relative poses in camera's egocentric view
-    @A_in_cam: (B,4,4) torch tensor
-    """
+def egocentric_delta_pose_to_pose(
+    A_in_cam: torch.Tensor, trans_delta: torch.Tensor, rot_mat_delta: torch.Tensor
+) -> torch.Tensor:
+    """Apply egocentric pose deltas to a batch of camera-frame poses."""
     B_in_cam = torch.eye(4, dtype=torch.float, device=A_in_cam.device)[None].expand(len(A_in_cam), -1, -1).contiguous()
     B_in_cam[:, :3, 3] = A_in_cam[:, :3, 3] + trans_delta
     B_in_cam[:, :3, :3] = rot_mat_delta @ A_in_cam[:, :3, :3]
     return B_in_cam
 
 
-def sdg_load_bounding_box(file_path: str):
-    """Load bounding boxes.
-
-    Args:
-        file_path: Path of the bounding box.
-
-    Returns:
-        A dictionary of the bounding boxes.
-    """
-    bbox_dict = {}
-    bbox_array = np.load(file_path)
-    for id, x_min, y_min, x_max, y_max, occlusion_ratio in zip(
-        bbox_array["semanticId"],
-        bbox_array["x_min"],
-        bbox_array["y_min"],
-        bbox_array["x_max"],
-        bbox_array["y_max"],
-        bbox_array["occlusionRatio"],
-        strict=False,
-    ):
-        bbox_dict[id] = {
-            "x_min": x_min,
-            "y_min": y_min,
-            "x_max": x_max,
-            "y_max": y_max,
-            "occlusion_ratio": occlusion_ratio,
-        }
-    return bbox_dict
+def matrix_distance(R1: np.ndarray, R2: np.ndarray) -> float:
+    """Return the angular distance between two rotation matrices."""
+    R_rel = R1.T @ R2
+    trace = np.trace(R_rel)
+    cos_theta = (trace - 1) / 2
+    cos_theta = np.clip(cos_theta, -1.0, 1.0)
+    return float(np.arccos(cos_theta))
 
 
-def texture_map_interpolation(tex_image_numpy):
-    all_channels = []
-    mask = np.all(tex_image_numpy == 0, axis=2)
-    x = np.arange(0, tex_image_numpy.shape[1])
-    y = np.arange(0, tex_image_numpy.shape[0])
-    xx, yy = np.meshgrid(x, y)
-    for each_channel in range(tex_image_numpy.shape[2]):
-        curr_channel = tex_image_numpy[:, :, each_channel]
-        x1 = xx[~mask]
-        y1 = yy[~mask]
-        newarr = curr_channel[~mask]
-        GD1 = griddata((x1, y1), newarr.ravel(), (xx, yy), method="nearest")
-        all_channels.append(GD1[:, :, np.newaxis].round().astype(np.uint8))
-    final_image = np.concatenate(all_channels, axis=-1)
-    return final_image
+def cluster_poses(
+    angle_diff: float, dist_diff: float, poses_in: Sequence[np.ndarray], symmetry_tfs: Sequence[np.ndarray]
+) -> list[np.ndarray]:
+    """Cluster similar poses under translational and rotational thresholds."""
+    poses_out = [poses_in[0]]
+    radian_thres = angle_diff / 180.0 * np.pi
 
+    for i in range(1, len(poses_in)):
+        isnew = True
+        cur_pose = poses_in[i]
+        for cluster in poses_out:
+            t0 = cluster[0:3, 3]
+            t1 = cur_pose[0:3, 3]
 
-class OctreeManager:
-    def __init__(self, pts=None, max_level=None, octree=None):
-        import kaolin
+            if np.linalg.norm(t0 - t1) >= dist_diff:
+                continue
 
-        if octree is None:
-            pts_quantized = kaolin.ops.spc.quantize_points(pts.contiguous(), level=max_level)
-            self.octree = kaolin.ops.spc.unbatched_points_to_octree(pts_quantized, max_level, sorted=False)
-        else:
-            self.octree = octree
-        lengths = torch.tensor([len(self.octree)], dtype=torch.int32).cpu()
-        self.max_level, self.pyramids, self.exsum = kaolin.ops.spc.scan_octrees(self.octree, lengths)
-        self.finest_vox_size = 2.0 / (2**self.max_level)
-        self.n_level = self.max_level + 1
-        self.vox_point_all_levels = kaolin.ops.spc.generate_points(self.octree, self.pyramids, self.exsum)
-        self.point_hierarchy_dual, self.pyramid_dual = kaolin.ops.spc.unbatched_make_dual(
-            self.vox_point_all_levels, self.pyramids[0]
-        )
-        self.trinkets, self.pointers_to_parent = kaolin.ops.spc.unbatched_make_trinkets(
-            self.vox_point_all_levels, self.pyramids[0], self.point_hierarchy_dual, self.pyramid_dual
-        )
-        self.n_vox = len(self.vox_point_all_levels)
-        self.n_corners = len(self.point_hierarchy_dual)
+            for tf in symmetry_tfs:
+                cur_pose_tmp = np.dot(cur_pose, tf)
+                rot_diff = matrix_distance(cur_pose_tmp[0:3, 0:3], cluster[0:3, 0:3])
+                if rot_diff < radian_thres:
+                    isnew = False
+                    break
 
-        for level in range(self.n_level):
-            vox_pts = self.get_level_quantized_points(level)
-            corner_pts = self.get_level_corner_quantized_points(level)
-            logging.info(f"level:{level}, vox_pts:{vox_pts.shape}, corner_pts:{corner_pts.shape}")
+            if not isnew:
+                break
 
-    def get_level_corner_quantized_points(self, level):
-        start = self.pyramid_dual[..., 1, level]
-        num = self.pyramid_dual[..., 0, level]
-        return self.point_hierarchy_dual[start : start + num]
+        if isnew:
+            poses_out.append(poses_in[i])
 
-    def get_level_quantized_points(self, level):
-        start = self.pyramids[..., 1, level]
-        num = self.pyramids[..., 0, level]
-        return self.vox_point_all_levels[start : start + num]
-
-    def get_center_ids(self, x, level):
-        """Get ids with 0 starting from current level's first point"""
-        import kaolin
-
-        pidx = kaolin.ops.spc.unbatched_query(self.octree, self.exsum, x.float(), level, with_parents=False)
-        return pidx
-
-    def get_vox_size_at_level(self, level):
-        return 2.0 / (2**level)
-
-    def draw(self, level, method="point"):
-        logging.info(f"level:{level}")
-        vox_size = self.get_vox_size_at_level(level)
-
-        if method == "point":
-            corner_coords = self.get_level_corner_quantized_points(level)
-            pts = corner_coords * vox_size - 1
-            mesh = trimesh.points.PointCloud(pts.data.cpu().numpy().reshape(-1, 3))
-            return mesh
-
-    def ray_trace(self, rays_o, rays_d, level, debug=False):
-        """Octree is in normalized [-1,1] world coordinate frame
-        'rays_o': ray origin in normalized world coordinate system
-        'rays_d': (N,3) unit length ray direction in normalized world coordinate system
-        'octree': spc
-        @voxel_size: in the scale of [-1,1] space
-        Return:
-            ray_depths_in_out: traveling times, NOT the Z value; invalid will be zeros
-        """
-        import kaolin
-        from mycuda import common
-
-        ray_index, rays_pid, depth_in_out = kaolin.render.spc.unbatched_raytrace(
-            self.octree,
-            self.vox_point_all_levels,
-            self.pyramids[0],
-            self.exsum,
-            rays_o,
-            rays_d,
-            level=level,
-            return_depth=True,
-            with_exit=True,
-        )
-        if ray_index.size()[0] == 0:
-            pdb.set_trace()
-            print("[WARNING] batch has 0 intersections!!")
-            ray_depths_in_out = torch.zeros((rays_o.shape[0], 1, 2))
-            rays_pid = -torch.ones_like(rays_o[:, :1])
-            rays_near = torch.zeros_like(rays_o[:, :1])
-            rays_far = torch.zeros_like(rays_o[:, :1])
-            return rays_near, rays_far, rays_pid, ray_depths_in_out
-
-        intersected_ray_ids, counts = torch.unique_consecutive(ray_index, return_counts=True)
-        max_intersections = counts.max().item()
-        start_poss = torch.cat([torch.tensor([0], device=counts.device), torch.cumsum(counts[:-1], dim=0)], dim=0)
-
-        ray_depths_in_out = common.postprocessOctreeRayTracing(
-            ray_index.long().contiguous(),
-            depth_in_out.contiguous(),
-            intersected_ray_ids.long().contiguous(),
-            start_poss.long().contiguous(),
-            max_intersections,
-            rays_o.shape[0],
-        )
-
-        rays_far = ray_depths_in_out[:, :, 1].max(dim=-1)[0].reshape(-1, 1)
-        rays_near = ray_depths_in_out[:, 0, 0].reshape(-1, 1)
-
-        return rays_near, rays_far, rays_pid, ray_depths_in_out
-
-
-def make_yaml_dumpable(D):
-    if isinstance(D, np.ndarray):
-        return D.tolist()
-    for d in D:
-        if isinstance(D[d], dict) or isinstance(D[d], OrderedDict) or isinstance(D[d], defaultdict):
-            D[d] = dict(D[d])
-            D[d] = make_yaml_dumpable(D[d])
-            continue
-        if isinstance(D[d], np.ndarray):
-            D[d] = D[d].tolist()
-            continue
-        if np.issubdtype(type(D[d]), int):
-            D[d] = int(D[d])
-            continue
-        if np.issubdtype(type(D[d]), float):
-            D[d] = float(D[d])
-            continue
-        if np.issubdtype(type(D[d]), str):
-            D[d] = str(D[d])
-            continue
-        if isinstance(D[d], list):
-            for i in range(len(D[d])):
-                D[d][i] = make_yaml_dumpable(D[d][i])
-            continue
-    return dict(D)
+    return poses_out

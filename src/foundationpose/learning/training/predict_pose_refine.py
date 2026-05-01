@@ -6,14 +6,17 @@
 # distribution of this software and related documentation without an express
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 
+"""Inference helpers for pose-refinement training artifacts."""
 
 import logging
-import os
+from pathlib import Path
 
 import kornia
 import numpy as np
+import nvdiffrast.torch as dr
 import torch
-from omegaconf import OmegaConf
+import trimesh
+from omegaconf import DictConfig, OmegaConf
 from pytorch3d.transforms import rotation_6d_to_matrix, so3_exp_map
 
 from foundationpose.learning.datasets.h5_dataset import PoseRefinePairH5Dataset
@@ -30,32 +33,36 @@ from foundationpose.Utils import (
     transform_pts,
 )
 
+logger = logging.getLogger(__name__)
+
+TensorMap = dict[str, torch.Tensor]
+ArrayTensor = np.ndarray | torch.Tensor
+RasterizeContext = dr.RasterizeCudaContext | dr.RasterizeGLContext
+
 
 @torch.inference_mode()
 def make_crop_data_batch(
-    render_size,
-    ob_in_cams,
-    mesh,
-    rgb,
-    depth,
-    K,
-    crop_ratio,
-    xyz_map,
-    normal_map=None,
-    mesh_diameter=None,
-    cfg=None,
-    glctx=None,
-    mesh_tensors=None,
-    dataset: PoseRefinePairH5Dataset = None,
-):
-    logging.info("Welcome make_crop_data_batch")
+    cfg: DictConfig,
+    dataset: PoseRefinePairH5Dataset,
+    render_size: tuple[int, int],
+    ob_in_cams: ArrayTensor,
+    mesh: trimesh.Trimesh,
+    rgb: ArrayTensor,
+    depth: ArrayTensor,
+    K: ArrayTensor,
+    crop_ratio: float,
+    xyz_map: ArrayTensor,
+    normal_map: ArrayTensor | None = None,
+    mesh_diameter: float | None = None,
+    glctx: RasterizeContext | None = None,
+    mesh_tensors: TensorMap | None = None,
+) -> BatchPoseData:
+    """Build a refinement batch from rendered and observed object crops."""
+    logger.debug("Building refine crop batch")
     H, W = depth.shape[:2]
-    args = []
     method = "box_3d"
     tf_to_crops = compute_crop_window_tf_batch(
         pts=mesh.vertices,
-        H=H,
-        W=W,
         poses=ob_in_cams,
         K=K,
         crop_ratio=crop_ratio,
@@ -64,7 +71,7 @@ def make_crop_data_batch(
         mesh_diameter=mesh_diameter,
     )
 
-    logging.info("make tf_to_crops done")
+    logger.debug("Computed crop transforms")
 
     B = len(ob_in_cams)
     poseA = torch.as_tensor(ob_in_cams, dtype=torch.float, device="cuda")
@@ -85,10 +92,10 @@ def make_crop_data_batch(
     for b in range(0, len(poseA), bs):
         extra = {}
         rgb_r, depth_r, normal_r = nvdiffrast_render(
+            ob_in_cams=poseA[b : b + bs],
             K=K,
             H=H,
             W=W,
-            ob_in_cams=poseA[b : b + bs],
             context="cuda",
             get_normal=cfg["use_normal"],
             glctx=glctx,
@@ -109,7 +116,7 @@ def make_crop_data_batch(
     if cfg["use_normal"]:
         normal_rs = torch.cat(normal_rs, dim=0).permute(0, 3, 1, 2)  # (B,3,H,W)
 
-    logging.info("render done")
+    logger.debug("Rendered synthetic crops")
 
     rgbBs = kornia.geometry.transform.warp_perspective(
         torch.as_tensor(rgb, dtype=torch.float, device="cuda").permute(2, 0, 1)[None].expand(B, -1, -1, -1),
@@ -153,7 +160,7 @@ def make_crop_data_batch(
         normalAs = None
         normalBs = None
 
-    logging.info("warp done")
+    logger.debug("Warped observed crops")
 
     mesh_diameters = torch.ones((len(rgbAs)), dtype=torch.float, device="cuda") * mesh_diameter
     pose_data = BatchPoseData(
@@ -171,25 +178,28 @@ def make_crop_data_batch(
         Ks=Ks,
         mesh_diameters=mesh_diameters,
     )
-    pose_data = dataset.transform_batch(batch=pose_data, H_ori=H, W_ori=W, bound=1)
+    pose_data = dataset.transform_batch(batch=pose_data, H_ori=H, W_ori=W)
 
-    logging.info("pose batch data done")
+    logger.debug("Prepared refinement batch data")
 
     return pose_data
 
 
 class PoseRefinePredictor:
-    def __init__(self):
-        logging.info("welcome")
+    """Wrapper around the pretrained pose-refinement network."""
+
+    def __init__(self, checkpoints_dir: str | Path) -> None:  # noqa: PLR0912
+        logger.debug("Initializing pose refine predictor")
         self.amp = True
         self.run_name = "2023-10-28-18-33-37"
         model_name = "model_best.pth"
-        code_dir = os.path.dirname(os.path.realpath(__file__))
-        ckpt_dir = f"{code_dir}/../../weights/{self.run_name}/{model_name}"
+        weights_dir = Path(checkpoints_dir)
+        run_dir = weights_dir / self.run_name
+        ckpt_dir = run_dir / model_name
 
-        self.cfg = OmegaConf.load(f"{code_dir}/../../weights/{self.run_name}/config.yml")
+        self.cfg = OmegaConf.load(run_dir / "config.yml")
 
-        self.cfg["ckpt_dir"] = ckpt_dir
+        self.cfg["ckpt_dir"] = str(ckpt_dir)
         self.cfg["enable_amp"] = True
 
         ########## Defaults, to be backward compatible
@@ -217,53 +227,55 @@ class PoseRefinePredictor:
             self.cfg["zfar"] = np.inf
         if "normal_uint8" not in self.cfg:
             self.cfg["normal_uint8"] = False
-        logging.info(f"self.cfg: \n {OmegaConf.to_yaml(self.cfg)}")
+        logger.info("self.cfg:\n%s", OmegaConf.to_yaml(self.cfg))
 
         self.dataset = PoseRefinePairH5Dataset(cfg=self.cfg, h5_file="", mode="test")
-        self.model = RefineNet(cfg=self.cfg, c_in=self.cfg["c_in"]).cuda()
+        self.model = RefineNet(
+            use_batch_norm=self.cfg["use_BN"], rotation_representation=self.cfg["rot_rep"], c_in=self.cfg["c_in"]
+        ).cuda()
 
-        logging.info(f"Using pretrained model from {ckpt_dir}")
+        logger.info("Using pretrained model from %s", ckpt_dir)
         ckpt = torch.load(ckpt_dir)
         if "model" in ckpt:
             ckpt = ckpt["model"]
         self.model.load_state_dict(ckpt)
 
         self.model.cuda().eval()
-        logging.info("init done")
+        logger.info("Initialized pose refine predictor")
         self.last_trans_update = None
         self.last_rot_update = None
 
     @torch.inference_mode()
-    def predict(
+    def predict(  # noqa: PLR0912, PLR0915
         self,
-        rgb,
-        depth,
-        K,
-        ob_in_cams,
-        xyz_map,
-        normal_map=None,
-        get_vis=False,
-        mesh=None,
-        mesh_tensors=None,
-        glctx=None,
-        mesh_diameter=None,
-        iteration=5,
-    ):
-        """@rgb: np array (H,W,3)
-        @ob_in_cams: np array (N,4,4)
-        """
+        rgb: ArrayTensor,
+        depth: ArrayTensor,
+        K: ArrayTensor,
+        ob_in_cams: ArrayTensor,
+        xyz_map: ArrayTensor,
+        normal_map: ArrayTensor | None = None,
+        get_vis: bool = False,
+        mesh: trimesh.Trimesh | None = None,
+        mesh_tensors: TensorMap | None = None,
+        glctx: RasterizeContext | None = None,
+        mesh_diameter: float | None = None,
+        iteration: int = 5,
+    ) -> tuple[torch.Tensor, np.ndarray | None]:
+        """Refine candidate object poses for a single RGB-D observation."""
         torch.set_default_tensor_type("torch.cuda.FloatTensor")
-        logging.info(f"ob_in_cams:{ob_in_cams.shape}")
+        logger.debug("ob_in_cams shape: %s", ob_in_cams.shape)
         tf_to_center = np.eye(4)
         ob_centered_in_cams = ob_in_cams
         mesh_centered = mesh
 
-        logging.info(f"self.cfg.use_normal:{self.cfg.use_normal}")
+        logger.debug("self.cfg.use_normal: %s", self.cfg.use_normal)
         if not self.cfg.use_normal:
             normal_map = None
 
         crop_ratio = self.cfg["crop_ratio"]
-        logging.info(f"trans_normalizer:{self.cfg['trans_normalizer']}, rot_normalizer:{self.cfg['rot_normalizer']}")
+        logger.debug(
+            "trans_normalizer: %s, rot_normalizer: %s", self.cfg["trans_normalizer"], self.cfg["rot_normalizer"]
+        )
         bs = 1024
 
         B_in_cams = torch.as_tensor(ob_centered_in_cams, device="cuda", dtype=torch.float)
@@ -279,8 +291,10 @@ class PoseRefinePredictor:
             trans_normalizer = torch.as_tensor(list(trans_normalizer), device="cuda", dtype=torch.float).reshape(1, 3)
 
         for _ in range(iteration):
-            logging.info("making cropped data")
+            logger.debug("Building cropped refinement inputs")
             pose_data = make_crop_data_batch(
+                self.cfg,
+                self.dataset,
                 self.cfg.input_resize,
                 B_in_cams,
                 mesh_centered,
@@ -290,10 +304,8 @@ class PoseRefinePredictor:
                 crop_ratio=crop_ratio,
                 normal_map=normal_map,
                 xyz_map=xyz_map_tensor,
-                cfg=self.cfg,
                 glctx=glctx,
                 mesh_tensors=mesh_tensors,
-                dataset=self.dataset,
                 mesh_diameter=mesh_diameter,
             )
             B_in_cams = []
@@ -304,12 +316,12 @@ class PoseRefinePredictor:
                 B = torch.cat(
                     [pose_data.rgbBs[b : b + bs].cuda(), pose_data.xyz_mapBs[b : b + bs].cuda()], dim=1
                 ).float()
-                logging.info("forward start")
-                with torch.cuda.amp.autocast(enabled=self.amp):
+                logger.debug("Starting refine forward pass")
+                with torch.amp.autocast("cuda", enabled=self.amp):
                     output = self.model(A, B)
                 for k in output:
                     output[k] = output[k].float()
-                logging.info("forward done")
+                logger.debug("Completed refine forward pass")
                 if self.cfg["trans_rep"] == "tracknet":
                     if not self.cfg["normalize_xyz"]:
                         trans_delta = torch.tanh(output["trans"]) * trans_normalizer
@@ -317,11 +329,17 @@ class PoseRefinePredictor:
                         trans_delta = output["trans"]
 
                 elif self.cfg["trans_rep"] == "deepim":
+                    ks_batch = pose_data.Ks[b : b + bs]
+                    tf_to_crops_batch = pose_data.tf_to_crops[b : b + bs]
 
-                    def project_and_transform_to_crop(centers):
-                        uvs = (pose_data.Ks[b : b + bs] @ centers.reshape(-1, 3, 1)).reshape(-1, 3)
+                    def project_and_transform_to_crop(
+                        centers: torch.Tensor,
+                        ks_batch: torch.Tensor = ks_batch,
+                        tf_to_crops_batch: torch.Tensor = tf_to_crops_batch,
+                    ) -> torch.Tensor:
+                        uvs = (ks_batch @ centers.reshape(-1, 3, 1)).reshape(-1, 3)
                         uvs = uvs / uvs[:, 2:3]
-                        uvs = (pose_data.tf_to_crops[b : b + bs] @ uvs.reshape(-1, 3, 1)).reshape(-1, 3)
+                        uvs = (tf_to_crops_batch @ uvs.reshape(-1, 3, 1)).reshape(-1, 3)
                         return uvs[:, :2]
 
                     rot_delta = output["rot"]
@@ -364,10 +382,11 @@ class PoseRefinePredictor:
         self.last_rot_update = rot_mat_delta
 
         if get_vis:
-            logging.info("get_vis...")
-            canvas = []
+            logger.debug("Rendering refinement visualization")
             padding = 2
             pose_data = make_crop_data_batch(
+                self.cfg,
+                self.dataset,
                 self.cfg.input_resize,
                 torch.as_tensor(ob_centered_in_cams),
                 mesh_centered,
@@ -377,23 +396,22 @@ class PoseRefinePredictor:
                 crop_ratio=crop_ratio,
                 normal_map=normal_map,
                 xyz_map=xyz_map_tensor,
-                cfg=self.cfg,
                 glctx=glctx,
                 mesh_tensors=mesh_tensors,
-                dataset=self.dataset,
                 mesh_diameter=mesh_diameter,
             )
-            for id in range(len(B_in_cams)):
-                rgbA_vis = (pose_data.rgbAs[id] * 255).permute(1, 2, 0).data.cpu().numpy()
-                rgbB_vis = (pose_data.rgbBs[id] * 255).permute(1, 2, 0).data.cpu().numpy()
+            canvas = []
+            for idx in range(len(B_in_cams)):
+                rgbA_vis = (pose_data.rgbAs[idx] * 255).permute(1, 2, 0).data.cpu().numpy()
+                rgbB_vis = (pose_data.rgbBs[idx] * 255).permute(1, 2, 0).data.cpu().numpy()
                 row = [rgbA_vis, rgbB_vis]
                 H, W = rgbA_vis.shape[:2]
                 if pose_data.depthAs is not None:
-                    depthA = pose_data.depthAs[id].data.cpu().numpy().reshape(H, W)
-                    depthB = pose_data.depthBs[id].data.cpu().numpy().reshape(H, W)
+                    depthA = pose_data.depthAs[idx].data.cpu().numpy().reshape(H, W)
+                    depthB = pose_data.depthBs[idx].data.cpu().numpy().reshape(H, W)
                 elif pose_data.xyz_mapAs is not None:
-                    depthA = pose_data.xyz_mapAs[id][2].data.cpu().numpy().reshape(H, W)
-                    depthB = pose_data.xyz_mapBs[id][2].data.cpu().numpy().reshape(H, W)
+                    depthA = pose_data.xyz_mapAs[idx][2].data.cpu().numpy().reshape(H, W)
+                    depthB = pose_data.xyz_mapBs[idx][2].data.cpu().numpy().reshape(H, W)
                 zmin = min(depthA.min(), depthB.min())
                 zmax = max(depthA.max(), depthB.max())
                 depthA_vis = depth_to_vis(depthA, zmin=zmin, zmax=zmax, inverse=False)
@@ -402,11 +420,13 @@ class PoseRefinePredictor:
                 if pose_data.normalAs is not None:
                     pass
                 row = make_grid_image(row, nrow=len(row), padding=padding, pad_value=255)
-                row = cv_draw_text(row, text=f"id:{id}", uv_top_left=(10, 10), color=(0, 255, 0), fontScale=0.5)
+                row = cv_draw_text(row, text=f"id:{idx}", uv_top_left=(10, 10), color=(0, 255, 0), fontScale=0.5)
                 canvas.append(row)
             canvas = make_grid_image(canvas, nrow=1, padding=padding, pad_value=255)
 
             pose_data = make_crop_data_batch(
+                self.cfg,
+                self.dataset,
                 self.cfg.input_resize,
                 B_in_cams,
                 mesh_centered,
@@ -416,24 +436,22 @@ class PoseRefinePredictor:
                 crop_ratio=crop_ratio,
                 normal_map=normal_map,
                 xyz_map=xyz_map_tensor,
-                cfg=self.cfg,
                 glctx=glctx,
                 mesh_tensors=mesh_tensors,
-                dataset=self.dataset,
                 mesh_diameter=mesh_diameter,
             )
             canvas_refined = []
-            for id in range(len(B_in_cams)):
-                rgbA_vis = (pose_data.rgbAs[id] * 255).permute(1, 2, 0).data.cpu().numpy()
-                rgbB_vis = (pose_data.rgbBs[id] * 255).permute(1, 2, 0).data.cpu().numpy()
+            for idx in range(len(B_in_cams)):
+                rgbA_vis = (pose_data.rgbAs[idx] * 255).permute(1, 2, 0).data.cpu().numpy()
+                rgbB_vis = (pose_data.rgbBs[idx] * 255).permute(1, 2, 0).data.cpu().numpy()
                 row = [rgbA_vis, rgbB_vis]
                 H, W = rgbA_vis.shape[:2]
                 if pose_data.depthAs is not None:
-                    depthA = pose_data.depthAs[id].data.cpu().numpy().reshape(H, W)
-                    depthB = pose_data.depthBs[id].data.cpu().numpy().reshape(H, W)
+                    depthA = pose_data.depthAs[idx].data.cpu().numpy().reshape(H, W)
+                    depthB = pose_data.depthBs[idx].data.cpu().numpy().reshape(H, W)
                 elif pose_data.xyz_mapAs is not None:
-                    depthA = pose_data.xyz_mapAs[id][2].data.cpu().numpy().reshape(H, W)
-                    depthB = pose_data.xyz_mapBs[id][2].data.cpu().numpy().reshape(H, W)
+                    depthA = pose_data.xyz_mapAs[idx][2].data.cpu().numpy().reshape(H, W)
+                    depthB = pose_data.xyz_mapBs[idx][2].data.cpu().numpy().reshape(H, W)
                 zmin = min(depthA.min(), depthB.min())
                 zmax = max(depthA.max(), depthB.max())
                 depthA_vis = depth_to_vis(depthA, zmin=zmin, zmax=zmax, inverse=False)

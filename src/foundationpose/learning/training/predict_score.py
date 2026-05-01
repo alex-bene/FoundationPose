@@ -6,19 +6,22 @@
 # distribution of this software and related documentation without an express
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 
+"""Inference helpers for score-model training artifacts."""
 
 import logging
-import os
+from pathlib import Path
 
 import cv2
 import kornia
 import numpy as np
+import nvdiffrast.torch as dr
 import torch
-from omegaconf import OmegaConf
+import trimesh
+from omegaconf import DictConfig, OmegaConf
 
-from foundationpose.learning.datasets.h5_dataset import TripletH5Dataset
+from foundationpose.learning.datasets.h5_dataset import ScoreMultiPairH5Dataset, TripletH5Dataset
 from foundationpose.learning.datasets.pose_dataset import BatchPoseData
-from foundationpose.learning.models.score_network import ScoreMultiPairH5Dataset, ScoreNetMultiPair
+from foundationpose.learning.models.score_network import ScoreNetMultiPair
 from foundationpose.Utils import (
     compute_crop_window_tf_batch,
     cv_draw_text,
@@ -28,66 +31,72 @@ from foundationpose.Utils import (
     transform_pts,
 )
 
+logger = logging.getLogger(__name__)
 
-def vis_batch_data_scores(pose_data, ids, scores, pad_margin=5):
-    assert len(scores) == len(ids)
+TensorMap = dict[str, torch.Tensor]
+ArrayTensor = np.ndarray | torch.Tensor
+RasterizeContext = dr.RasterizeCudaContext | dr.RasterizeGLContext
+
+
+def vis_batch_data_scores(
+    pose_data: BatchPoseData, ids: torch.Tensor, scores: torch.Tensor, pad_margin: int = 5
+) -> np.ndarray:
+    """Render score-sorted crop pairs for debugging."""
+    if len(scores) != len(ids):
+        raise ValueError
+
     canvas = []
-    for id in ids:
-        rgbA_vis = (pose_data.rgbAs[id] * 255).permute(1, 2, 0).data.cpu().numpy()
-        rgbB_vis = (pose_data.rgbBs[id] * 255).permute(1, 2, 0).data.cpu().numpy()
+    for idx_tensor in ids:
+        idx = int(idx_tensor)
+        rgbA_vis = (pose_data.rgbAs[idx] * 255).permute(1, 2, 0).data.cpu().numpy()
+        rgbB_vis = (pose_data.rgbBs[idx] * 255).permute(1, 2, 0).data.cpu().numpy()
         H, W = rgbA_vis.shape[:2]
-        zmin = pose_data.depthAs[id].data.cpu().numpy().reshape(H, W).min()
-        zmax = pose_data.depthAs[id].data.cpu().numpy().reshape(H, W).max()
+        zmin = pose_data.depthAs[idx].data.cpu().numpy().reshape(H, W).min()
+        zmax = pose_data.depthAs[idx].data.cpu().numpy().reshape(H, W).max()
         depthA_vis = depth_to_vis(
-            pose_data.depthAs[id].data.cpu().numpy().reshape(H, W), zmin=zmin, zmax=zmax, inverse=False
+            pose_data.depthAs[idx].data.cpu().numpy().reshape(H, W), zmin=zmin, zmax=zmax, inverse=False
         )
         depthB_vis = depth_to_vis(
-            pose_data.depthBs[id].data.cpu().numpy().reshape(H, W), zmin=zmin, zmax=zmax, inverse=False
+            pose_data.depthBs[idx].data.cpu().numpy().reshape(H, W), zmin=zmin, zmax=zmax, inverse=False
         )
-        if pose_data.normalAs is not None:
-            pass
         pad = np.ones((rgbA_vis.shape[0], pad_margin, 3)) * 255
-        if pose_data.normalAs is not None:
-            pass
-        else:
-            row = np.concatenate([rgbA_vis, pad, depthA_vis, pad, rgbB_vis, pad, depthB_vis], axis=1)
+        row = np.concatenate([rgbA_vis, pad, depthA_vis, pad, rgbB_vis, pad, depthB_vis], axis=1)
         s = 100 / row.shape[0]
         row = cv2.resize(row, fx=s, fy=s, dsize=None)
+        score_value = float(scores[idx])
         row = cv_draw_text(
-            row, text=f"id:{id}, score:{scores[id]:.3f}", uv_top_left=(10, 10), color=(0, 255, 0), fontScale=0.5
+            row, text=f"id:{idx}, score:{score_value:.3f}", uv_top_left=(10, 10), color=(0, 255, 0), fontScale=0.5
         )
         canvas.append(row)
         pad = np.ones((pad_margin, row.shape[1], 3)) * 255
         canvas.append(pad)
-    canvas = np.concatenate(canvas, axis=0).astype(np.uint8)
-    return canvas
+    return np.concatenate(canvas, axis=0).astype(np.uint8)
 
 
 @torch.no_grad()
 def make_crop_data_batch(
-    render_size,
-    ob_in_cams,
-    mesh,
-    rgb,
-    depth,
-    K,
-    crop_ratio,
-    normal_map=None,
-    mesh_diameter=None,
-    glctx=None,
-    mesh_tensors=None,
-    dataset: TripletH5Dataset = None,
-    cfg=None,
-):
-    logging.info("Welcome make_crop_data_batch")
+    cfg: DictConfig,
+    dataset: TripletH5Dataset,
+    render_size: tuple[int, int],
+    ob_in_cams: ArrayTensor,
+    mesh: trimesh.Trimesh,
+    rgb: ArrayTensor,
+    depth: ArrayTensor,
+    K: ArrayTensor,
+    crop_ratio: float,
+    normal_map: ArrayTensor | None = None,
+    mesh_diameter: float | None = None,
+    glctx: RasterizeContext | None = None,
+    mesh_tensors: TensorMap | None = None,
+) -> BatchPoseData:
+    """Build a score-model batch from image crops and rendered views."""
+    _ = normal_map
+    logger.debug("Building score crop batch")
     H, W = depth.shape[:2]
 
-    args = []
     method = "box_3d"
     tf_to_crops = compute_crop_window_tf_batch(
         pts=mesh.vertices,
-        H=H,
-        W=W,
         poses=ob_in_cams,
         K=K,
         crop_ratio=crop_ratio,
@@ -95,7 +104,7 @@ def make_crop_data_batch(
         method=method,
         mesh_diameter=mesh_diameter,
     )
-    logging.info("make tf_to_crops done")
+    logger.debug("Computed crop transforms")
 
     B = len(ob_in_cams)
     poseAs = torch.as_tensor(ob_in_cams, dtype=torch.float, device="cuda")
@@ -114,11 +123,11 @@ def make_crop_data_batch(
 
     for b in range(0, len(ob_in_cams), bs):
         extra = {}
-        rgb_r, depth_r, normal_r = nvdiffrast_render(
+        rgb_r, depth_r, _ = nvdiffrast_render(
+            ob_in_cams=poseAs[b : b + bs],
             K=K,
             H=H,
             W=W,
-            ob_in_cams=poseAs[b : b + bs],
             context="cuda",
             get_normal=cfg["use_normal"],
             glctx=glctx,
@@ -135,7 +144,7 @@ def make_crop_data_batch(
     rgb_rs = torch.cat(rgb_rs, dim=0).permute(0, 3, 1, 2) * 255
     depth_rs = torch.cat(depth_rs, dim=0).permute(0, 3, 1, 2)
     xyz_map_rs = torch.cat(xyz_map_rs, dim=0).permute(0, 3, 1, 2)  # (B,3,H,W)
-    logging.info("render done")
+    logger.debug("Rendered synthetic crops")
 
     rgbBs = kornia.geometry.transform.warp_perspective(
         torch.as_tensor(rgb, dtype=torch.float, device="cuda").permute(2, 0, 1)[None].expand(B, -1, -1, -1),
@@ -188,25 +197,29 @@ def make_crop_data_batch(
         Ks=Ks,
         mesh_diameters=mesh_diameters,
     )
-    pose_data = dataset.transform_batch(pose_data, H_ori=H, W_ori=W, bound=1)
+    pose_data = dataset.transform_batch(pose_data, H_ori=H, W_ori=W)
 
-    logging.info("pose batch data done")
+    logger.debug("Prepared score batch data")
 
     return pose_data
 
 
 class ScorePredictor:
-    def __init__(self, amp=True):
+    """Wrapper around the pretrained score network used during inference."""
+
+    def __init__(self, checkpoints_dir: str | Path, amp: bool = True, device: str = "cuda") -> None:
         self.amp = amp
+        self.device = device
         self.run_name = "2024-01-11-20-02-45"
 
         model_name = "model_best.pth"
-        code_dir = os.path.dirname(os.path.realpath(__file__))
-        ckpt_dir = f"{code_dir}/../../weights/{self.run_name}/{model_name}"
+        weights_dir = Path(checkpoints_dir)
+        run_dir = weights_dir / self.run_name
+        ckpt_dir = run_dir / model_name
 
-        self.cfg = OmegaConf.load(f"{code_dir}/../../weights/{self.run_name}/config.yml")
+        self.cfg = OmegaConf.load(run_dir / "config.yml")
 
-        self.cfg["ckpt_dir"] = ckpt_dir
+        self.cfg["ckpt_dir"] = str(ckpt_dir)
         self.cfg["enable_amp"] = True
 
         ########## Defaults, to be backward compatible
@@ -223,43 +236,39 @@ class ScorePredictor:
         if "crop_ratio" not in self.cfg or self.cfg["crop_ratio"] is None:
             self.cfg["crop_ratio"] = 1.2
 
-        logging.info(f"self.cfg: \n {OmegaConf.to_yaml(self.cfg)}")
+        logger.info("self.cfg:\n%s", OmegaConf.to_yaml(self.cfg))
 
         self.dataset = ScoreMultiPairH5Dataset(cfg=self.cfg, mode="test", h5_file=None, max_num_key=1)
-        self.model = ScoreNetMultiPair(cfg=self.cfg, c_in=self.cfg["c_in"]).cuda()
+        self.model = ScoreNetMultiPair(use_batch_norm=self.cfg["use_BN"], c_in=self.cfg["c_in"]).cuda()
 
-        logging.info(f"Using pretrained model from {ckpt_dir}")
+        logger.info("Using pretrained model from %s", ckpt_dir)
         ckpt = torch.load(ckpt_dir)
         if "model" in ckpt:
             ckpt = ckpt["model"]
         self.model.load_state_dict(ckpt)
 
         self.model.cuda().eval()
-        logging.info("init done")
+        logger.info("Initialized score predictor")
 
     @torch.inference_mode()
     def predict(
         self,
-        rgb,
-        depth,
-        K,
-        ob_in_cams,
-        normal_map=None,
-        get_vis=False,
-        mesh=None,
-        mesh_tensors=None,
-        glctx=None,
-        mesh_diameter=None,
-    ):
-        """@rgb: np array (H,W,3)"""
-        logging.info(f"ob_in_cams:{ob_in_cams.shape}")
+        rgb: ArrayTensor,
+        depth: ArrayTensor,
+        K: ArrayTensor,
+        ob_in_cams: ArrayTensor,
+        get_vis: bool = False,
+        mesh: trimesh.Trimesh | None = None,
+        mesh_tensors: TensorMap | None = None,
+        glctx: RasterizeContext | None = None,
+        mesh_diameter: float | None = None,
+    ) -> tuple[torch.Tensor, np.ndarray | None]:
+        """Score candidate object poses for a single RGB-D observation."""
+        logger.debug("ob_in_cams shape: %s", ob_in_cams.shape)
         ob_in_cams = torch.as_tensor(ob_in_cams, dtype=torch.float, device="cuda")
 
-        logging.info(f"self.cfg.use_normal:{self.cfg.use_normal}")
-        if not self.cfg.use_normal:
-            normal_map = None
-
-        logging.info("making cropped data")
+        logger.debug("self.cfg.use_normal: %s", self.cfg.use_normal)
+        logger.debug("Building cropped score inputs")
 
         if mesh_tensors is None:
             mesh_tensors = make_mesh_tensors(mesh)
@@ -268,6 +277,8 @@ class ScorePredictor:
         depth = torch.as_tensor(depth, device="cuda", dtype=torch.float)
 
         pose_data = make_crop_data_batch(
+            self.cfg,
+            self.dataset,
             self.cfg.input_resize,
             ob_in_cams,
             mesh,
@@ -277,13 +288,11 @@ class ScorePredictor:
             crop_ratio=self.cfg["crop_ratio"],
             glctx=glctx,
             mesh_tensors=mesh_tensors,
-            dataset=self.dataset,
-            cfg=self.cfg,
             mesh_diameter=mesh_diameter,
         )
 
-        def find_best_among_pairs(pose_data: BatchPoseData):
-            logging.info(f"pose_data.rgbAs.shape[0]: {pose_data.rgbAs.shape[0]}")
+        def find_best_among_pairs(pose_data: BatchPoseData) -> tuple[torch.Tensor, torch.Tensor]:
+            logger.debug("pose_data.rgbAs batch size: %s", pose_data.rgbAs.shape[0])
             ids = []
             scores = []
             bs = pose_data.rgbAs.shape[0]
@@ -297,7 +306,7 @@ class ScorePredictor:
                 if pose_data.normalAs is not None:
                     A = torch.cat([A, pose_data.normalAs.cuda().float()], dim=1)
                     B = torch.cat([B, pose_data.normalBs.cuda().float()], dim=1)
-                with torch.cuda.amp.autocast(enabled=self.amp):
+                with torch.amp.autocast("cuda", enabled=self.amp):
                     output = self.model(A, B, L=len(A))
                 scores_cur = output["score_logit"].float().reshape(-1)
                 ids.append(scores_cur.argmax() + b)
@@ -320,12 +329,11 @@ class ScorePredictor:
 
         scores = scores_global
 
-        logging.info("forward done")
+        logger.debug("Completed score forward pass")
         torch.cuda.empty_cache()
 
         if get_vis:
-            logging.info("get_vis...")
-            canvas = []
+            logger.debug("Rendering score visualization")
             ids = scores.argsort(descending=True)
             canvas = vis_batch_data_scores(pose_data, ids=ids, scores=scores)
             return scores, canvas
