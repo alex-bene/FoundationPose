@@ -20,7 +20,6 @@ import open3d as o3d
 import scipy
 import torch
 import torch.nn.functional as F
-import torchvision
 import trimesh
 import warp as wp
 
@@ -243,16 +242,6 @@ def to_open3d_cloud(
     return cloud
 
 
-def make_grid_image(
-    imgs: Sequence[np.ndarray] | np.ndarray, nrow: int, padding: int = 5, pad_value: int = 255
-) -> np.ndarray:
-    """Create a tiled image grid from a batch of RGB images."""
-    grid = torchvision.utils.make_grid(
-        torch.as_tensor(np.asarray(imgs)).permute(0, 3, 1, 2), nrow=nrow, padding=padding, pad_value=pad_value
-    )
-    return grid.permute(1, 2, 0).contiguous().data.cpu().numpy().astype(np.uint8)
-
-
 if wp is not None:
 
     @wp.kernel(enable_backward=False)
@@ -434,39 +423,6 @@ def depth2xyzmap_batch(depths: torch.Tensor, Ks: torch.Tensor, zfar: float) -> t
     return xyz_maps
 
 
-def depth_to_vis(
-    depth: np.ndarray,
-    zmin: float | None = None,
-    zmax: float | None = None,
-    mode: Literal["gray", "rgb"] = "rgb",
-    inverse: bool = True,
-) -> np.ndarray:
-    """Convert a depth map into a visualizable grayscale or RGB image."""
-    if zmin is None:
-        zmin = depth.min()
-    if zmax is None:
-        zmax = depth.max()
-
-    if inverse:
-        invalid = depth < 0.001
-        vis = zmin / (depth + 1e-8)
-        vis[invalid] = 0
-    else:
-        depth = depth.clip(zmin, zmax)
-        invalid = (depth == zmin) | (depth == zmax)
-        vis = (depth - zmin) / (zmax - zmin)
-        vis[invalid] = 1
-
-    if mode == "gray":
-        vis = (vis * 255).clip(0, 255).astype(np.uint8)
-    elif mode == "rgb":
-        vis = cv2.applyColorMap((vis * 255).astype(np.uint8), cv2.COLORMAP_JET)[..., ::-1]
-    else:
-        raise RuntimeError
-
-    return vis
-
-
 def sample_views_icosphere(n_views: int, subdivisions: int | None = None, radius: float = 1) -> np.ndarray:
     """Sample camera poses from an icosphere."""
     if subdivisions is not None:
@@ -596,65 +552,6 @@ def compute_crop_window_tf_batch(
     top = center[:, 1] - radius
     bottom = center[:, 1] + radius
     return compute_tf_batch(left, right, top, bottom)
-
-
-def cv_draw_text(
-    img: np.ndarray,
-    text: str,
-    uv_top_left: Sequence[float],
-    color: ColorBgr = (255, 255, 255),
-    fontScale: float = 0.5,
-    thickness: int = 1,
-    fontFace: int = cv2.FONT_HERSHEY_SIMPLEX,
-    outline_color: ColorBgr | None = None,
-    line_spacing: float = 1.5,
-) -> np.ndarray:
-    """Draw multiline text while keeping the text box inside the image."""
-    H, W = img.shape[:2]
-    uv_top_left = np.array(uv_top_left, dtype=float)
-    if uv_top_left.shape != (2,):
-        msg = "`uv_top_left` must contain exactly two coordinates."
-        raise ValueError(msg)
-
-    for line in text.splitlines():
-        (w, h), _ = cv2.getTextSize(text=line, fontFace=fontFace, fontScale=fontScale, thickness=thickness)
-        uv_bottom_left_i = uv_top_left + np.array([0.0, float(h)])
-
-        ############# Ensure inside image
-        while uv_bottom_left_i[0] < 0:
-            uv_bottom_left_i[0] += 1
-        while uv_bottom_left_i[0] + w >= W:
-            uv_bottom_left_i[0] -= 1
-        while uv_bottom_left_i[1] >= H:
-            uv_bottom_left_i[1] -= 1
-        while uv_bottom_left_i[1] - h < 0:
-            uv_bottom_left_i[1] += 1
-
-        org = tuple(uv_bottom_left_i.astype(int))
-
-        if outline_color is not None:
-            cv2.putText(
-                img,
-                text=line,
-                org=org,
-                fontFace=fontFace,
-                fontScale=fontScale,
-                color=outline_color,
-                thickness=thickness,
-                lineType=cv2.LINE_AA,
-            )
-        cv2.putText(
-            img,
-            text=line,
-            org=org,
-            fontFace=fontFace,
-            fontScale=fontScale,
-            color=color,
-            thickness=thickness,
-            lineType=cv2.LINE_AA,
-        )
-        uv_top_left[1] = uv_bottom_left_i[1] - h + h * line_spacing
-    return img
 
 
 def projection_matrix_from_intrinsics(

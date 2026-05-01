@@ -10,13 +10,9 @@
 
 import logging
 import random
-from pathlib import Path
 
-import cv2
-import imageio
 import numpy as np
 import nvdiffrast.torch as dr
-import open3d as o3d
 import torch
 import torch.nn.functional as F
 import trimesh
@@ -64,15 +60,10 @@ class FoundationPose:
         scorer: ScorePredictor | None = None,
         refiner: PoseRefinePredictor | None = None,
         glctx: RasterizeContext | None = None,
-        debug: int = 0,
-        debug_dir: str | Path = "/home/bowen/debug/novel_pose_debug/",
     ) -> None:
         """Initialize the pose estimator with mesh geometry and predictors."""
         self.gt_pose = None
         self.ignore_normal_flip = True
-        self.debug = debug
-        self.debug_dir = Path(debug_dir)
-        self.debug_dir.mkdir(parents=True, exist_ok=True)
 
         self.reset_object(mesh, model_normals, symmetry_tfs=symmetry_tfs)
         self.make_rotation_grid(min_n_views=40, inplane_step=60)
@@ -185,14 +176,9 @@ class FoundationPose:
 
         zc = np.median(depth[valid])
         center = (np.linalg.inv(K) @ np.asarray([uc, vc, 1]).reshape(3, 1)) * zc
-
-        if self.debug >= 2:
-            pcd = to_open3d_cloud(center.reshape(1, 3))
-            o3d.io.write_point_cloud(str(self.debug_dir / "init_center.ply"), pcd)
-
         return center.reshape(3)
 
-    def register(  # noqa: PLR0915
+    def register(
         self,
         K: np.ndarray,
         rgb: np.ndarray,
@@ -217,13 +203,6 @@ class FoundationPose:
         depth = erode_depth(depth, radius=2, device="cuda")
         depth = bilateral_filter_depth(depth, radius=2, device="cuda")
 
-        if self.debug >= 2:
-            xyz_map = depth2xyzmap(depth, K)
-            valid = xyz_map[..., 2] >= 0.001
-            pcd = to_open3d_cloud(xyz_map[valid], rgb[valid])
-            o3d.io.write_point_cloud(str(self.debug_dir / "scene_raw.ply"), pcd)
-            cv2.imwrite(str(self.debug_dir / "ob_mask.png"), (ob_mask * 255.0).clip(0, 255))
-
         normal_map = None
         valid = (depth >= 0.001) & (ob_mask > 0)
         if valid.sum() < 4:
@@ -231,13 +210,6 @@ class FoundationPose:
             pose = np.eye(4)
             pose[:3, 3] = self.guess_translation(depth=depth, mask=ob_mask, K=K)
             return pose
-
-        if self.debug >= 2:
-            imageio.imwrite(self.debug_dir / "color.png", rgb)
-            cv2.imwrite(str(self.debug_dir / "depth.png"), (depth * 1000).astype(np.uint16))
-            valid = xyz_map[..., 2] >= 0.001
-            pcd = to_open3d_cloud(xyz_map[valid], rgb[valid])
-            o3d.io.write_point_cloud(str(self.debug_dir / "scene_complete.ply"), pcd)
 
         self.H, self.W = depth.shape[:2]
         self.K = K
@@ -253,7 +225,7 @@ class FoundationPose:
         poses[:, :3, 3] = torch.as_tensor(center.reshape(1, 3), device="cuda")
 
         xyz_map = depth2xyzmap(depth, K)
-        poses, vis = self.refiner.predict(
+        poses = self.refiner.predict(
             mesh=self.mesh,
             mesh_tensors=self.mesh_tensors,
             rgb=rgb,
@@ -265,12 +237,9 @@ class FoundationPose:
             glctx=self.glctx,
             mesh_diameter=self.diameter,
             iteration=iteration,
-            get_vis=self.debug >= 2,
         )
-        if vis is not None:
-            imageio.imwrite(self.debug_dir / "vis_refiner.png", vis)
 
-        scores, vis = self.scorer.predict(
+        scores = self.scorer.predict(
             mesh=self.mesh,
             rgb=rgb,
             depth=depth,
@@ -279,10 +248,7 @@ class FoundationPose:
             mesh_tensors=self.mesh_tensors,
             glctx=self.glctx,
             mesh_diameter=self.diameter,
-            get_vis=self.debug >= 2,
         )
-        if vis is not None:
-            imageio.imwrite(self.debug_dir / "vis_score.png", vis)
 
         ids = torch.as_tensor(scores).argsort(descending=True)
         logger.debug("sort ids:%s", ids)
@@ -297,14 +263,7 @@ class FoundationPose:
         self.scores = scores
         return best_pose.detach().cpu().numpy()
 
-    def track_one(
-        self,
-        rgb: np.ndarray,
-        depth: np.ndarray,
-        K: np.ndarray,
-        iteration: int,
-        extra: dict[str, np.ndarray] | None = None,
-    ) -> np.ndarray:
+    def track_one(self, rgb: np.ndarray, depth: np.ndarray, K: np.ndarray, iteration: int) -> np.ndarray:
         """Refine the previous pose estimate on a subsequent RGB-D frame."""
         if self.pose_last is None:
             logger.error("Please init pose by register first")
@@ -321,7 +280,7 @@ class FoundationPose:
             depth_tensor[None], torch.as_tensor(K, dtype=torch.float, device="cuda")[None], zfar=np.inf
         )[0]
 
-        pose, vis = self.refiner.predict(
+        pose = self.refiner.predict(
             mesh=self.mesh,
             mesh_tensors=self.mesh_tensors,
             rgb=rgb,
@@ -333,12 +292,7 @@ class FoundationPose:
             mesh_diameter=self.diameter,
             glctx=self.glctx,
             iteration=iteration,
-            get_vis=self.debug >= 2,
         )
         logger.debug("pose done")
-        if extra is None:
-            extra = {}
-        if self.debug >= 2 and vis is not None:
-            extra["vis"] = vis
         self.pose_last = pose
         return (pose @ self.get_tf_to_centered_mesh()).detach().cpu().numpy().reshape(4, 4)

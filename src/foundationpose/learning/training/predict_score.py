@@ -11,7 +11,6 @@
 import logging
 from pathlib import Path
 
-import cv2
 import kornia
 import numpy as np
 import nvdiffrast.torch as dr
@@ -22,55 +21,13 @@ from omegaconf import DictConfig, OmegaConf
 from foundationpose.learning.datasets.h5_dataset import ScoreMultiPairH5Dataset, TripletH5Dataset
 from foundationpose.learning.datasets.pose_dataset import BatchPoseData
 from foundationpose.learning.models.score_network import ScoreNetMultiPair
-from foundationpose.Utils import (
-    compute_crop_window_tf_batch,
-    cv_draw_text,
-    depth_to_vis,
-    make_mesh_tensors,
-    nvdiffrast_render,
-    transform_pts,
-)
+from foundationpose.Utils import compute_crop_window_tf_batch, make_mesh_tensors, nvdiffrast_render, transform_pts
 
 logger = logging.getLogger(__name__)
 
 TensorMap = dict[str, torch.Tensor]
 ArrayTensor = np.ndarray | torch.Tensor
 RasterizeContext = dr.RasterizeCudaContext | dr.RasterizeGLContext
-
-
-def vis_batch_data_scores(
-    pose_data: BatchPoseData, ids: torch.Tensor, scores: torch.Tensor, pad_margin: int = 5
-) -> np.ndarray:
-    """Render score-sorted crop pairs for debugging."""
-    if len(scores) != len(ids):
-        raise ValueError
-
-    canvas = []
-    for idx_tensor in ids:
-        idx = int(idx_tensor)
-        rgbA_vis = (pose_data.rgbAs[idx] * 255).permute(1, 2, 0).data.cpu().numpy()
-        rgbB_vis = (pose_data.rgbBs[idx] * 255).permute(1, 2, 0).data.cpu().numpy()
-        H, W = rgbA_vis.shape[:2]
-        zmin = pose_data.depthAs[idx].data.cpu().numpy().reshape(H, W).min()
-        zmax = pose_data.depthAs[idx].data.cpu().numpy().reshape(H, W).max()
-        depthA_vis = depth_to_vis(
-            pose_data.depthAs[idx].data.cpu().numpy().reshape(H, W), zmin=zmin, zmax=zmax, inverse=False
-        )
-        depthB_vis = depth_to_vis(
-            pose_data.depthBs[idx].data.cpu().numpy().reshape(H, W), zmin=zmin, zmax=zmax, inverse=False
-        )
-        pad = np.ones((rgbA_vis.shape[0], pad_margin, 3)) * 255
-        row = np.concatenate([rgbA_vis, pad, depthA_vis, pad, rgbB_vis, pad, depthB_vis], axis=1)
-        s = 100 / row.shape[0]
-        row = cv2.resize(row, fx=s, fy=s, dsize=None)
-        score_value = float(scores[idx])
-        row = cv_draw_text(
-            row, text=f"id:{idx}, score:{score_value:.3f}", uv_top_left=(10, 10), color=(0, 255, 0), fontScale=0.5
-        )
-        canvas.append(row)
-        pad = np.ones((pad_margin, row.shape[1], 3)) * 255
-        canvas.append(pad)
-    return np.concatenate(canvas, axis=0).astype(np.uint8)
 
 
 @torch.no_grad()
@@ -257,12 +214,11 @@ class ScorePredictor:
         depth: ArrayTensor,
         K: ArrayTensor,
         ob_in_cams: ArrayTensor,
-        get_vis: bool = False,
         mesh: trimesh.Trimesh | None = None,
         mesh_tensors: TensorMap | None = None,
         glctx: RasterizeContext | None = None,
         mesh_diameter: float | None = None,
-    ) -> tuple[torch.Tensor, np.ndarray | None]:
+    ) -> torch.Tensor:
         """Score candidate object poses for a single RGB-D observation."""
         logger.debug("ob_in_cams shape: %s", ob_in_cams.shape)
         ob_in_cams = torch.as_tensor(ob_in_cams, dtype=torch.float, device="cuda")
@@ -332,10 +288,4 @@ class ScorePredictor:
         logger.debug("Completed score forward pass")
         torch.cuda.empty_cache()
 
-        if get_vis:
-            logger.debug("Rendering score visualization")
-            ids = scores.argsort(descending=True)
-            canvas = vis_batch_data_scores(pose_data, ids=ids, scores=scores)
-            return scores, canvas
-
-        return scores, None
+        return scores

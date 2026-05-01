@@ -24,10 +24,7 @@ from foundationpose.learning.datasets.pose_dataset import BatchPoseData
 from foundationpose.learning.models.refine_network import RefineNet
 from foundationpose.Utils import (
     compute_crop_window_tf_batch,
-    cv_draw_text,
-    depth_to_vis,
     egocentric_delta_pose_to_pose,
-    make_grid_image,
     make_mesh_tensors,
     nvdiffrast_render,
     transform_pts,
@@ -254,13 +251,12 @@ class PoseRefinePredictor:
         ob_in_cams: ArrayTensor,
         xyz_map: ArrayTensor,
         normal_map: ArrayTensor | None = None,
-        get_vis: bool = False,
         mesh: trimesh.Trimesh | None = None,
         mesh_tensors: TensorMap | None = None,
         glctx: RasterizeContext | None = None,
         mesh_diameter: float | None = None,
         iteration: int = 5,
-    ) -> tuple[torch.Tensor, np.ndarray | None]:
+    ) -> torch.Tensor:
         """Refine candidate object poses for a single RGB-D observation."""
         torch.set_default_tensor_type("torch.cuda.FloatTensor")
         logger.debug("ob_in_cams shape: %s", ob_in_cams.shape)
@@ -380,89 +376,4 @@ class PoseRefinePredictor:
         torch.cuda.empty_cache()
         self.last_trans_update = trans_delta
         self.last_rot_update = rot_mat_delta
-
-        if get_vis:
-            logger.debug("Rendering refinement visualization")
-            padding = 2
-            pose_data = make_crop_data_batch(
-                self.cfg,
-                self.dataset,
-                self.cfg.input_resize,
-                torch.as_tensor(ob_centered_in_cams),
-                mesh_centered,
-                rgb,
-                depth,
-                K,
-                crop_ratio=crop_ratio,
-                normal_map=normal_map,
-                xyz_map=xyz_map_tensor,
-                glctx=glctx,
-                mesh_tensors=mesh_tensors,
-                mesh_diameter=mesh_diameter,
-            )
-            canvas = []
-            for idx in range(len(B_in_cams)):
-                rgbA_vis = (pose_data.rgbAs[idx] * 255).permute(1, 2, 0).data.cpu().numpy()
-                rgbB_vis = (pose_data.rgbBs[idx] * 255).permute(1, 2, 0).data.cpu().numpy()
-                row = [rgbA_vis, rgbB_vis]
-                H, W = rgbA_vis.shape[:2]
-                if pose_data.depthAs is not None:
-                    depthA = pose_data.depthAs[idx].data.cpu().numpy().reshape(H, W)
-                    depthB = pose_data.depthBs[idx].data.cpu().numpy().reshape(H, W)
-                elif pose_data.xyz_mapAs is not None:
-                    depthA = pose_data.xyz_mapAs[idx][2].data.cpu().numpy().reshape(H, W)
-                    depthB = pose_data.xyz_mapBs[idx][2].data.cpu().numpy().reshape(H, W)
-                zmin = min(depthA.min(), depthB.min())
-                zmax = max(depthA.max(), depthB.max())
-                depthA_vis = depth_to_vis(depthA, zmin=zmin, zmax=zmax, inverse=False)
-                depthB_vis = depth_to_vis(depthB, zmin=zmin, zmax=zmax, inverse=False)
-                row += [depthA_vis, depthB_vis]
-                if pose_data.normalAs is not None:
-                    pass
-                row = make_grid_image(row, nrow=len(row), padding=padding, pad_value=255)
-                row = cv_draw_text(row, text=f"id:{idx}", uv_top_left=(10, 10), color=(0, 255, 0), fontScale=0.5)
-                canvas.append(row)
-            canvas = make_grid_image(canvas, nrow=1, padding=padding, pad_value=255)
-
-            pose_data = make_crop_data_batch(
-                self.cfg,
-                self.dataset,
-                self.cfg.input_resize,
-                B_in_cams,
-                mesh_centered,
-                rgb,
-                depth,
-                K,
-                crop_ratio=crop_ratio,
-                normal_map=normal_map,
-                xyz_map=xyz_map_tensor,
-                glctx=glctx,
-                mesh_tensors=mesh_tensors,
-                mesh_diameter=mesh_diameter,
-            )
-            canvas_refined = []
-            for idx in range(len(B_in_cams)):
-                rgbA_vis = (pose_data.rgbAs[idx] * 255).permute(1, 2, 0).data.cpu().numpy()
-                rgbB_vis = (pose_data.rgbBs[idx] * 255).permute(1, 2, 0).data.cpu().numpy()
-                row = [rgbA_vis, rgbB_vis]
-                H, W = rgbA_vis.shape[:2]
-                if pose_data.depthAs is not None:
-                    depthA = pose_data.depthAs[idx].data.cpu().numpy().reshape(H, W)
-                    depthB = pose_data.depthBs[idx].data.cpu().numpy().reshape(H, W)
-                elif pose_data.xyz_mapAs is not None:
-                    depthA = pose_data.xyz_mapAs[idx][2].data.cpu().numpy().reshape(H, W)
-                    depthB = pose_data.xyz_mapBs[idx][2].data.cpu().numpy().reshape(H, W)
-                zmin = min(depthA.min(), depthB.min())
-                zmax = max(depthA.max(), depthB.max())
-                depthA_vis = depth_to_vis(depthA, zmin=zmin, zmax=zmax, inverse=False)
-                depthB_vis = depth_to_vis(depthB, zmin=zmin, zmax=zmax, inverse=False)
-                row += [depthA_vis, depthB_vis]
-                row = make_grid_image(row, nrow=len(row), padding=padding, pad_value=255)
-                canvas_refined.append(row)
-
-            canvas_refined = make_grid_image(canvas_refined, nrow=1, padding=padding, pad_value=255)
-            canvas = make_grid_image([canvas, canvas_refined], nrow=2, padding=padding, pad_value=255)
-            torch.cuda.empty_cache()
-            return B_in_cams_out, canvas
-
-        return B_in_cams_out, None
+        return B_in_cams_out
