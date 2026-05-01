@@ -21,7 +21,7 @@ from transformations import euler_matrix
 
 from foundationpose.learning.training.predict_pose_refine import PoseRefinePredictor
 from foundationpose.learning.training.predict_score import ScorePredictor
-from foundationpose.Utils import (
+from foundationpose.utils import (
     bilateral_filter_depth,
     cluster_poses,
     compute_mesh_diameter,

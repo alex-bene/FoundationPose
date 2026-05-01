@@ -29,54 +29,27 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-src_cpu = ["torch==2.8.0", "pytorch3d==0.7.8"]
-src_cu124 = ["torch==2.6.0", "pytorch3d==0.7.8"]
-src_cu126 = ["torch==2.8.0", "pytorch3d==0.7.8"]
-src_cu128 = ["torch==2.8.0", "pytorch3d==0.7.8"]
-cpu = ["torch==2.8.0", "pytorch3d==0.7.8+pt2.8.0cpu"]
-cu124 = ["torch==2.6.0", "pytorch3d==0.7.8+pt2.6.0cu124"]
-cu126 = ["torch==2.8.0", "pytorch3d==0.7.8+pt2.8.0cu126"]
-cu128 = ["torch==2.8.0", "pytorch3d==0.7.8+pt2.8.0cu128"]
+cpu = ["torch==2.8.0"]
+cu124 = ["torch==2.6.0"]
+cu126 = ["torch==2.8.0"]
+cu128 = ["torch==2.8.0"]
 
 [tool.uv.sources]
 torch = [
     { index = "pytorch-cpu", extra = "cpu" },
-    { index = "pytorch-cpu", extra = "src_cpu" },
     { index = "pytorch-cu124", extra = "cu124" },
-    { index = "pytorch-cu124", extra = "src_cu124" },
     { index = "pytorch-cu126", extra = "cu126" },
-    { index = "pytorch-cu126", extra = "src_cu126" },
     { index = "pytorch-cu128", extra = "cu128" },
-    { index = "pytorch-cu128", extra = "src_cu128" },
 ]
-pytorch3d = [
-    { index = "pytorch3d-wheels", extra = "cpu" },
-    { index = "pytorch3d-wheels", extra = "cu124" },
-    { index = "pytorch3d-wheels", extra = "cu126" },
-    { index = "pytorch3d-wheels", extra = "cu128" },
-    { git = "https://github.com/facebookresearch/pytorch3d.git", extra = "src_cpu" },
-    { git = "https://github.com/facebookresearch/pytorch3d.git", extra = "src_cu124" },
-    { git = "https://github.com/facebookresearch/pytorch3d.git", extra = "src_cu126" },
-    { git = "https://github.com/facebookresearch/pytorch3d.git", extra = "src_cu128" },
-]
-
 nvdiffrast = { git = "https://github.com/NVlabs/nvdiffrast.git" }
 
 [tool.uv.extra-build-dependencies]
 nvidia-pyindex = ["pip"]
-pytorch3d = ["torch", "setuptools"]
 nvdiffrast = [{ requirement = "torch", match-runtime = true }]
-
-[tool.uv.extra-build-variables]
-pytorch3d = { FORCE_CUDA = "1" }
 
 [tool.uv]
 conflicts = [
     [
-        { extra = "src_cpu" },
-        { extra = "src_cu124" },
-        { extra = "src_cu126" },
-        { extra = "src_cu128" },
         { extra = "cpu" },
         { extra = "cu124" },
         { extra = "cu126" },
@@ -102,11 +75,6 @@ explicit = true
 [[tool.uv.index]]
 name = "pytorch-cu128"
 url = "https://download.pytorch.org/whl/cu128"
-explicit = true
-
-[[tool.uv.index]]
-name = "pytorch3d-wheels"
-url = "https://miropsota.github.io/torch_packages_builder"
 explicit = true
 
 [dependency-groups]

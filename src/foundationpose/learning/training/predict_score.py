@@ -21,7 +21,7 @@ from omegaconf import DictConfig, OmegaConf
 from foundationpose.learning.datasets.h5_dataset import ScoreMultiPairH5Dataset, TripletH5Dataset
 from foundationpose.learning.datasets.pose_dataset import BatchPoseData
 from foundationpose.learning.models.score_network import ScoreNetMultiPair
-from foundationpose.Utils import compute_crop_window_tf_batch, make_mesh_tensors, nvdiffrast_render, transform_pts
+from foundationpose.utils import compute_crop_window_tf_batch, make_mesh_tensors, nvdiffrast_render, transform_pts
 
 logger = logging.getLogger(__name__)
 

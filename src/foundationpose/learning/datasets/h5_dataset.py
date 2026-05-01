@@ -22,7 +22,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from foundationpose.Utils import depth2xyzmap_batch
+from foundationpose.utils import depth2xyzmap_batch
 
 if TYPE_CHECKING:
     from .pose_dataset import BatchPoseData

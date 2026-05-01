@@ -17,12 +17,12 @@ import nvdiffrast.torch as dr
 import torch
 import trimesh
 from omegaconf import DictConfig, OmegaConf
-from pytorch3d.transforms import rotation_6d_to_matrix, so3_exp_map
 
 from foundationpose.learning.datasets.h5_dataset import PoseRefinePairH5Dataset
 from foundationpose.learning.datasets.pose_dataset import BatchPoseData
 from foundationpose.learning.models.refine_network import RefineNet
-from foundationpose.Utils import (
+from foundationpose.pytorch3d.transforms import rotation_6d_to_matrix, so3_exp_map
+from foundationpose.utils import (
     compute_crop_window_tf_batch,
     egocentric_delta_pose_to_pose,
     make_mesh_tensors,
