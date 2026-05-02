@@ -25,7 +25,7 @@ The goal of this fork is packaging and simplification, not preserving the full u
 This package is intended to be installed directly from GitHub with `uv`.
 
 ```bash
-uv add git+https://github.com/alex-bene/FoundationPose.git"
+uv add git+https://github.com/alex-bene/FoundationPose.git
 ```
 
 ## Pretrained Weights

@@ -79,7 +79,7 @@ def make_mesh_tensors(
 
 def nvdiffrast_render(  # noqa: PLR0912, PLR0915
     ob_in_cams: torch.Tensor,
-    K: np.ndarray | None = None,
+    K: torch.Tensor | None = None,
     H: int | None = None,
     W: int | None = None,
     glctx: RasterizeContext | None = None,
@@ -159,7 +159,7 @@ def nvdiffrast_render(  # noqa: PLR0912, PLR0915
         extra = {}
 
     ob_in_glcams = torch.as_tensor(glcam_in_cvcam, device=render_device, dtype=torch.float)[None] @ ob_in_cams
-    projection_mat = torch.as_tensor(projection_mat.reshape(-1, 4, 4), device=render_device, dtype=torch.float)
+    projection_mat = projection_mat.reshape(-1, 4, 4)
     mtx = projection_mat @ ob_in_glcams
 
     pts_cam = transform_pts(pos, ob_in_cams)
@@ -297,30 +297,18 @@ if wp is not None:
             out[h, w] = depth_sum / sum_weight
 
     def bilateral_filter_depth(
-        depth: np.ndarray | torch.Tensor,
-        radius: int = 2,
-        zfar: float = 100,
-        sigmaD: float = 2,
-        sigmaR: float = 100000,
-        device: DeviceLike = "cuda",
-    ) -> np.ndarray | torch.Tensor:
+        depth: torch.Tensor, radius: int = 2, zfar: float = 100, sigmaD: float = 2, sigmaR: float = 100000
+    ) -> torch.Tensor:
         """Apply a bilateral filter to a depth map using Warp."""
-        if isinstance(depth, np.ndarray):
-            depth_wp = wp.array(depth, dtype=float, device=device)
-        else:
-            depth_wp = wp.from_torch(depth)
-        out_wp = wp.zeros(depth.shape, dtype=float, device=device)
+        depth_wp = wp.from_torch(depth)
+        out_wp = wp.zeros(depth.shape, dtype=float, device=depth.device)
         wp.launch(
             kernel=bilateral_filter_depth_kernel,
-            device=device,
+            device=depth.device,
             dim=[depth.shape[0], depth.shape[1]],
             inputs=[depth_wp, out_wp, radius, zfar, sigmaD, sigmaR],
         )
-        depth_out = wp.to_torch(out_wp)
-
-        if isinstance(depth, np.ndarray):
-            depth_out = depth_out.data.cpu().numpy()
-        return depth_out
+        return wp.to_torch(out_wp)
 
     @wp.kernel(enable_backward=False)
     def erode_depth_kernel(
@@ -358,46 +346,39 @@ if wp is not None:
             out[h, w] = d_ori
 
     def erode_depth(
-        depth: np.ndarray | torch.Tensor,
+        depth: torch.Tensor,
         radius: int = 2,
         depth_diff_thres: float = 0.001,
         ratio_thres: float = 0.8,
         zfar: float = 100,
-        device: DeviceLike = "cuda",
-    ) -> np.ndarray | torch.Tensor:
+    ) -> torch.Tensor:
         """Erode unstable depth pixels using local agreement."""
-        depth_wp = wp.from_torch(torch.as_tensor(depth, dtype=torch.float, device=device))
-        out_wp = wp.zeros(depth.shape, dtype=float, device=device)
+        depth_wp = wp.from_torch(depth)
+        out_wp = wp.zeros(depth.shape, dtype=depth.dtype, device=depth.device)
         wp.launch(
             kernel=erode_depth_kernel,
-            device=device,
+            device=depth.device,
             dim=[depth.shape[0], depth.shape[1]],
             inputs=[depth_wp, out_wp, radius, depth_diff_thres, ratio_thres, zfar],
         )
-        depth_out = wp.to_torch(out_wp)
-
-        if isinstance(depth, np.ndarray):
-            depth_out = depth_out.data.cpu().numpy()
-        return depth_out
+        return wp.to_torch(out_wp)
 
 
-def depth2xyzmap(depth: np.ndarray, K: np.ndarray, uvs: np.ndarray | None = None) -> np.ndarray:
+def depth2xyzmap(depth: torch.Tensor, K: torch.Tensor) -> torch.Tensor:
     """Project a depth map into an XYZ map using camera intrinsics."""
     invalid_mask = depth < 0.001
     H, W = depth.shape[:2]
-    if uvs is None:
-        vs, us = np.meshgrid(np.arange(0, H), np.arange(0, W), sparse=False, indexing="ij")
-        vs = vs.reshape(-1)
-        us = us.reshape(-1)
-    else:
-        uvs = uvs.round().astype(int)
-        us = uvs[:, 0]
-        vs = uvs[:, 1]
+    vs, us = torch.meshgrid(
+        torch.arange(0, H, device=depth.device), torch.arange(0, W, device=depth.device), indexing="ij"
+    )
+    vs = vs.reshape(-1).to(dtype=depth.dtype)
+    us = us.reshape(-1).to(dtype=depth.dtype)
+
     zs = depth[vs, us]
     xs = (us - K[0, 2]) * zs / K[0, 0]
     ys = (vs - K[1, 2]) * zs / K[1, 1]
-    pts = np.stack((xs.reshape(-1), ys.reshape(-1), zs.reshape(-1)), 1)  # (N,3)
-    xyz_map = np.zeros((H, W, 3), dtype=np.float32)
+    pts = torch.stack((xs.reshape(-1), ys.reshape(-1), zs.reshape(-1)), 1)  # (N,3)
+    xyz_map = depth.new_zeros((H, W, 3))
     xyz_map[vs, us] = pts
     xyz_map[invalid_mask] = 0
     return xyz_map
@@ -497,7 +478,7 @@ def compute_mesh_diameter(
 def compute_crop_window_tf_batch(
     pts: torch.Tensor | None = None,
     poses: torch.Tensor | None = None,
-    K: np.ndarray | torch.Tensor | None = None,
+    K: torch.Tensor | None = None,
     crop_ratio: float = 1.2,
     out_size: Sequence[int] | torch.Tensor | np.ndarray | None = None,
     method: str = "min_box",
@@ -541,7 +522,6 @@ def compute_crop_window_tf_batch(
         [0, 0, 0, radius, 0, 0, -radius, 0, 0, 0, radius, 0, 0, -radius, 0], device=poses.device, dtype=poses.dtype
     ).reshape(-1, 3)
     pts = poses[:, :3, 3].reshape(-1, 1, 3) + offsets.reshape(1, -1, 3)
-    K = torch.as_tensor(K, device=poses.device, dtype=poses.dtype)
     projected = (K @ pts.reshape(-1, 3).T).T
     uvs = projected[:, :2] / projected[:, 2:3]
     uvs = uvs.reshape(B, -1, 2)
@@ -555,13 +535,13 @@ def compute_crop_window_tf_batch(
 
 
 def projection_matrix_from_intrinsics(
-    K: np.ndarray,
+    K: torch.Tensor,
     height: int,
     width: int,
     znear: float,
     zfar: float,
     window_coords: Literal["y_up", "y_down"] = "y_down",
-) -> np.ndarray:
+) -> torch.Tensor:
     """Conversion of Hartley-Zisserman intrinsic matrix to OpenGL proj. matrix.
 
     Ref:
@@ -592,7 +572,7 @@ def projection_matrix_from_intrinsics(
     # Draw our images upside down, so that all the pixel-based coordinate
     # systems are the same.
     if window_coords == "y_up":
-        proj = np.array(
+        proj = K.new_tensor(
             [
                 [2 * K[0, 0] / w, -2 * K[0, 1] / w, (-2 * K[0, 2] + w + 2 * x0) / w, 0],
                 [0, -2 * K[1, 1] / h, (-2 * K[1, 2] + h + 2 * y0) / h, 0],
@@ -604,7 +584,7 @@ def projection_matrix_from_intrinsics(
     # Draw the images upright and modify the projection matrix so that OpenGL
     # will generate window coords that compensate for the flipped image coords.
     elif window_coords == "y_down":
-        proj = np.array(
+        proj = K.new_tensor(
             [
                 [2 * K[0, 0] / w, -2 * K[0, 1] / w, (-2 * K[0, 2] + w + 2 * x0) / w, 0],
                 [0, 2 * K[1, 1] / h, (2 * K[1, 2] - h + 2 * y0) / h, 0],
