@@ -54,9 +54,9 @@ def make_mesh_tensors(
             if max_size > max_tex_size:
                 scale = 1 / max_size * max_tex_size
                 img = cv2.resize(img, fx=scale, fy=scale, dsize=None)
-        mesh_tensors["tex"] = torch.as_tensor(img, device=device, dtype=torch.float)[None] / 255.0
+        mesh_tensors["tex"] = torch.as_tensor(img, device=device, dtype=torch.float32)[None] / 255.0
         mesh_tensors["uv_idx"] = torch.as_tensor(mesh.faces, device=device, dtype=torch.int)
-        uv = torch.as_tensor(mesh.visual.uv, device=device, dtype=torch.float)
+        uv = torch.as_tensor(mesh.visual.uv, device=device, dtype=torch.float32)
         uv[:, 1] = 1 - uv[:, 1]
         mesh_tensors["uv"] = uv
     else:
@@ -64,14 +64,14 @@ def make_mesh_tensors(
             logger.warning("mesh doesn't have vertex_colors, assigning a pure color")
             mesh.visual.vertex_colors = np.tile(np.array([128, 128, 128]).reshape(1, 3), (len(mesh.vertices), 1))
         mesh_tensors["vertex_color"] = (
-            torch.as_tensor(mesh.visual.vertex_colors[..., :3], device=device, dtype=torch.float) / 255.0
+            torch.as_tensor(mesh.visual.vertex_colors[..., :3], device=device, dtype=torch.float32) / 255.0
         )
 
     mesh_tensors.update(
         {
-            "pos": torch.tensor(mesh.vertices, device=device, dtype=torch.float),
+            "pos": torch.tensor(mesh.vertices, device=device, dtype=torch.float32),
             "faces": torch.tensor(mesh.faces, device=device, dtype=torch.int),
-            "vnormals": torch.tensor(mesh.vertex_normals, device=device, dtype=torch.float),
+            "vnormals": torch.tensor(mesh.vertex_normals, device=device, dtype=torch.float32),
         }
     )
     return mesh_tensors
@@ -87,7 +87,7 @@ def nvdiffrast_render(  # noqa: PLR0912, PLR0915
     get_normal: bool = False,
     mesh_tensors: MeshTensorMap | None = None,
     mesh: trimesh.Trimesh | None = None,
-    projection_mat: np.ndarray | None = None,
+    projection_mat: torch.Tensor | None = None,
     bbox2d: torch.Tensor | None = None,
     output_size: Sequence[int] | np.ndarray | None = None,
     use_light: bool = False,
@@ -121,25 +121,25 @@ def nvdiffrast_render(  # noqa: PLR0912, PLR0915
         w_diffuse: Diffuse lighting weight.
         extra: Output dictionary populated with auxiliary tensors.
     """
+    device = ob_in_cams.device
+
     if glctx is None:
         if context == "gl":
-            glctx = dr.RasterizeGLContext()
-        elif context == "cuda":
-            glctx = dr.RasterizeCudaContext()
+            glctx = dr.RasterizeGLContext(device=device)
+        elif "cuda" in str(context):
+            glctx = dr.RasterizeCudaContext(device=device)
         else:
             raise NotImplementedError
-        logger.debug("created context")
 
     if mesh_tensors is None:
         if mesh is None:
             msg = "`mesh` is required when `mesh_tensors` is not provided."
             raise ValueError(msg)
-        mesh_tensors = make_mesh_tensors(mesh)
+        mesh_tensors = make_mesh_tensors(mesh, device=device)
     pos = mesh_tensors["pos"]
     vnormals = mesh_tensors["vnormals"]
     pos_idx = mesh_tensors["faces"]
     has_tex = "tex" in mesh_tensors
-    render_device = ob_in_cams.device
 
     if projection_mat is None:
         if K is None or H is None or W is None:
@@ -150,7 +150,7 @@ def nvdiffrast_render(  # noqa: PLR0912, PLR0915
         if H is None or W is None:
             msg = "`H` and `W` are required when `output_size` is not provided."
             raise ValueError(msg)
-        output_size = np.asarray([H, W])
+        output_size = (H, W)
     if light_dir is None:
         light_dir = DEFAULT_LIGHT_DIR
     if light_pos is None:
@@ -158,7 +158,7 @@ def nvdiffrast_render(  # noqa: PLR0912, PLR0915
     if extra is None:
         extra = {}
 
-    ob_in_glcams = torch.as_tensor(glcam_in_cvcam, device=render_device, dtype=torch.float)[None] @ ob_in_cams
+    ob_in_glcams = torch.as_tensor(glcam_in_cvcam, device=device, dtype=torch.float32)[None] @ ob_in_cams
     projection_mat = projection_mat.reshape(-1, 4, 4)
     mtx = projection_mat @ ob_in_glcams
 
@@ -174,17 +174,14 @@ def nvdiffrast_render(  # noqa: PLR0912, PLR0915
         r = bbox2d[:, 2]
         b = H - bbox2d[:, 3]
         tf = (
-            torch.eye(4, dtype=torch.float, device=render_device)
-            .reshape(1, 4, 4)
-            .expand(len(ob_in_cams), 4, 4)
-            .contiguous()
+            torch.eye(4, dtype=torch.float32, device=device).reshape(1, 4, 4).expand(len(ob_in_cams), 4, 4).contiguous()
         )
         tf[:, 0, 0] = W / (r - left)
         tf[:, 1, 1] = H / (t - b)
         tf[:, 3, 0] = (W - r - left) / (r - left)
         tf[:, 3, 1] = (H - t - b) / (t - b)
         pos_clip = pos_clip @ tf
-    rast_out, _ = dr.rasterize(glctx, pos_clip, pos_idx, resolution=np.asarray(output_size))
+    rast_out, _ = dr.rasterize(glctx, pos_clip, pos_idx, resolution=output_size)
     xyz_map, _ = dr.interpolate(pts_cam, rast_out, pos_idx)
     depth = xyz_map[..., 2]
     if has_tex:
@@ -205,18 +202,14 @@ def nvdiffrast_render(  # noqa: PLR0912, PLR0915
 
     if use_light:
         if light_dir is not None:
-            light_dir_neg = -torch.as_tensor(light_dir, dtype=torch.float, device=render_device)
+            light_dir_neg = -torch.as_tensor(light_dir, dtype=torch.float32, device=device)
         else:
-            light_dir_neg = (
-                torch.as_tensor(light_pos, dtype=torch.float, device=render_device).reshape(1, 1, 3) - pts_cam
-            )
+            light_dir_neg = torch.as_tensor(light_pos, dtype=torch.float32, device=device).reshape(1, 1, 3) - pts_cam
         diffuse_intensity = (
             (F.normalize(vnormals_cam, dim=-1) * F.normalize(light_dir_neg, dim=-1)).sum(dim=-1).clip(0, 1)[..., None]
         )
         diffuse_intensity_map, _ = dr.interpolate(diffuse_intensity, rast_out, pos_idx)  # (N_pose, H, W, 1)
-        light_color = (
-            color if light_color is None else torch.as_tensor(light_color, device=render_device, dtype=torch.float)
-        )
+        light_color = color if light_color is None else torch.as_tensor(light_color, device=device, dtype=torch.float32)
         color = color * w_ambient + diffuse_intensity_map * light_color * w_diffuse
 
     color = color.clip(0, 1)
@@ -260,8 +253,8 @@ if wp is not None:
         if w >= W or h >= H:
             return
         out[h, w] = 0.0
-        mean_depth = 0.0
-        num_valid = 0
+        mean_depth = float(0)
+        num_valid = int(0.0)
         for u in range(w - radius, w + radius + 1):
             if u < 0 or u >= W:
                 continue
@@ -277,8 +270,8 @@ if wp is not None:
         mean_depth /= float(num_valid)
 
         depthCenter = depth[h, w]
-        sum_weight = 0.0
-        depth_sum = 0.0
+        sum_weight = float(0)
+        depth_sum = float(0)
         for u in range(w - radius, w + radius + 1):
             if u < 0 or u >= W:
                 continue
@@ -301,10 +294,10 @@ if wp is not None:
     ) -> torch.Tensor:
         """Apply a bilateral filter to a depth map using Warp."""
         depth_wp = wp.from_torch(depth)
-        out_wp = wp.zeros(depth.shape, dtype=float, device=depth.device)
+        out_wp = wp.zeros(depth.shape, dtype=float, device=str(depth.device))
         wp.launch(
             kernel=bilateral_filter_depth_kernel,
-            device=depth.device,
+            device=str(depth.device),
             dim=[depth.shape[0], depth.shape[1]],
             inputs=[depth_wp, out_wp, radius, zfar, sigmaD, sigmaR],
         )
@@ -354,10 +347,10 @@ if wp is not None:
     ) -> torch.Tensor:
         """Erode unstable depth pixels using local agreement."""
         depth_wp = wp.from_torch(depth)
-        out_wp = wp.zeros(depth.shape, dtype=depth.dtype, device=depth.device)
+        out_wp = wp.zeros(depth.shape, dtype=float, device=str(depth.device))
         wp.launch(
             kernel=erode_depth_kernel,
-            device=depth.device,
+            device=str(depth.device),
             dim=[depth.shape[0], depth.shape[1]],
             inputs=[depth_wp, out_wp, radius, depth_diff_thres, ratio_thres, zfar],
         )
@@ -371,8 +364,8 @@ def depth2xyzmap(depth: torch.Tensor, K: torch.Tensor) -> torch.Tensor:
     vs, us = torch.meshgrid(
         torch.arange(0, H, device=depth.device), torch.arange(0, W, device=depth.device), indexing="ij"
     )
-    vs = vs.reshape(-1).to(dtype=depth.dtype)
-    us = us.reshape(-1).to(dtype=depth.dtype)
+    vs = vs.reshape(-1)
+    us = us.reshape(-1)
 
     zs = depth[vs, us]
     xs = (us - K[0, 2]) * zs / K[0, 0]
@@ -434,7 +427,7 @@ def sample_views_icosphere(n_views: int, subdivisions: int | None = None, radius
 
 def to_homo_torch(pts: torch.Tensor) -> torch.Tensor:
     """Append a homogeneous coordinate to the last dimension of a tensor."""
-    ones = torch.ones((*pts.shape[:-1], 1), dtype=torch.float, device=pts.device)
+    ones = torch.ones((*pts.shape[:-1], 1), dtype=torch.float32, device=pts.device)
     return torch.cat((pts, ones), dim=-1)
 
 
@@ -602,7 +595,9 @@ def egocentric_delta_pose_to_pose(
     A_in_cam: torch.Tensor, trans_delta: torch.Tensor, rot_mat_delta: torch.Tensor
 ) -> torch.Tensor:
     """Apply egocentric pose deltas to a batch of camera-frame poses."""
-    B_in_cam = torch.eye(4, dtype=torch.float, device=A_in_cam.device)[None].expand(len(A_in_cam), -1, -1).contiguous()
+    B_in_cam = (
+        torch.eye(4, dtype=A_in_cam.dtype, device=A_in_cam.device)[None].expand(len(A_in_cam), -1, -1).contiguous()
+    )
     B_in_cam[:, :3, 3] = A_in_cam[:, :3, 3] + trans_delta
     B_in_cam[:, :3, :3] = rot_mat_delta @ A_in_cam[:, :3, :3]
     return B_in_cam

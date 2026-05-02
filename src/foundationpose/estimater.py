@@ -96,11 +96,13 @@ class FoundationPose:
         """Rebuild mesh-derived caches for a new object model."""
         max_xyz = mesh.vertices.max(axis=0)
         min_xyz = mesh.vertices.min(axis=0)
-        self.model_center = torch.as_tensor((min_xyz + max_xyz) / 2, device=self.device, dtype=torch.float32)
+        model_center = (min_xyz + max_xyz) / 2
 
         self.mesh_ori = mesh.copy()
         mesh = mesh.copy()
-        mesh.vertices = mesh.vertices - self.model_center.reshape(1, 3)
+        mesh.vertices = mesh.vertices - model_center.reshape(1, 3)
+
+        self.model_center = torch.as_tensor(model_center, device=self.device, dtype=torch.float32)
 
         model_pts = mesh.vertices
         self.diameter = compute_mesh_diameter(model_pts=mesh.vertices, n_sample=10000)
@@ -118,7 +120,7 @@ class FoundationPose:
         )
 
         self.mesh = mesh
-        self.mesh_tensors: TensorMap = make_mesh_tensors(self.mesh)
+        self.mesh_tensors: TensorMap = make_mesh_tensors(self.mesh, self.device)
 
         if symmetry_tfs is None:
             self.symmetry_tfs = torch.eye(4, dtype=torch.float32, device=self.device)[None]
@@ -190,7 +192,7 @@ class FoundationPose:
             logger.debug("valid is empty")
             return depth.new_zeros(3)
 
-        zc = torch.median(depth[valid])[0]
+        zc = torch.median(depth[valid])
         center = (K.inverse() @ depth.new_tensor([uc, vc, 1]).reshape(3, 1)) * zc
         return center.reshape(3)
 
@@ -221,12 +223,17 @@ class FoundationPose:
 
         if self.glctx is None:
             if glctx is None:
-                self.glctx = dr.RasterizeCudaContext()  # dr.RasterizeGLContext()
+                self.glctx = dr.RasterizeCudaContext(self.device)  # dr.RasterizeGLContext()
             else:
                 self.glctx = glctx
 
-        depth = erode_depth(depth, radius=2, device=self.device)
-        depth = bilateral_filter_depth(depth, radius=2, device=self.device)
+        K = torch.as_tensor(K, device=self.device, dtype=torch.float32)
+        rgb = torch.as_tensor(rgb, device=self.device, dtype=torch.float32)
+        depth = torch.as_tensor(depth, device=self.device, dtype=torch.float32)
+        ob_mask = torch.as_tensor(ob_mask, device=self.device, dtype=torch.float32)
+
+        depth = erode_depth(depth, radius=2)
+        depth = bilateral_filter_depth(depth, radius=2)
 
         normal_map = None
         valid = (depth >= 0.001) & (ob_mask > 0)
@@ -332,8 +339,8 @@ class FoundationPose:
             msg = "register must be called before track_one"
             raise RuntimeError(msg)
 
-        depth = erode_depth(depth, radius=2, device=self.device)
-        depth = bilateral_filter_depth(depth, radius=2, device=self.device)
+        depth = erode_depth(depth, radius=2)
+        depth = bilateral_filter_depth(depth, radius=2)
 
         pose = self.refiner.predict(
             mesh=self.mesh,

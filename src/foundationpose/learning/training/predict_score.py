@@ -58,6 +58,9 @@ def make_crop_data_batch(
     xyz_map = xyz_map.to(dtype=torch.float32, device=device) if xyz_map is not None else None
     normal_map = normal_map.to(dtype=torch.float32, device=device) if normal_map is not None else None
     K = K.to(dtype=torch.float32, device=device)
+    mesh_tensors = (
+        {key: value.to(device=device) for key, value in mesh_tensors.items()} if mesh_tensors is not None else None
+    )
 
     tf_to_crops = compute_crop_window_tf_batch(
         pts=torch.tensor(mesh.vertices, dtype=torch.float32, device=device),
@@ -239,7 +242,7 @@ class ScorePredictor:
         ob_in_cams = ob_in_cams.to(device=self.device, dtype=torch.float32)
 
         if mesh_tensors is None:
-            mesh_tensors = make_mesh_tensors(mesh)
+            mesh_tensors = make_mesh_tensors(mesh, self.device)
 
         pose_data = make_crop_data_batch(
             mesh=mesh,
@@ -276,7 +279,7 @@ class ScorePredictor:
                     B = torch.cat([B, pose_data.normalBs], dim=1)
                 with torch.amp.autocast(self.device.type, enabled=self.amp):
                     output = self.model(A, B, L=len(A))
-                scores_cur = output["score_logit"].reshape(-1)
+                scores_cur = output["score_logit"].reshape(-1).to(dtype=torch.float32)
                 ids.append(scores_cur.argmax() + b)
                 scores.append(scores_cur)
             ids = torch.stack(ids, dim=0).reshape(-1)

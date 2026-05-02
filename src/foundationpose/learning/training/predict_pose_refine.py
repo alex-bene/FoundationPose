@@ -116,7 +116,7 @@ class PoseRefinePredictor:
         if not use_normal:
             normal_map = None
         if mesh_tensors is None:
-            mesh_tensors = make_mesh_tensors(mesh_centered)
+            mesh_tensors = make_mesh_tensors(mesh_centered, self.device)
 
         if rgb_only:
             depth_tensor = torch.zeros_like(depth_tensor)
@@ -152,6 +152,8 @@ class PoseRefinePredictor:
                 B = torch.cat([pose_data.rgbBs[b : b + bs], pose_data.xyz_mapBs[b : b + bs]], dim=1)
                 with torch.amp.autocast(self.device.type, enabled=self.amp):
                     output = self.model(A, B)
+                output["trans"] = output["trans"].to(dtype=torch.float32)
+                output["rot"] = output["rot"].to(dtype=torch.float32)
                 if trans_rep == "tracknet":
                     if not normalize_xyz:
                         trans_delta = torch.tanh(output["trans"]) * trans_normalizer
