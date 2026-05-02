@@ -22,7 +22,6 @@ dependencies = [
     "omegaconf>=2.3.0",
     "imageio",
     "h5py",
-    "scipy",
     "warp-lang",
     "numpy>=2",
     "open3d",

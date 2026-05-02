@@ -105,7 +105,9 @@ class FoundationPose:
         self.model_center = torch.as_tensor(model_center, device=self.device, dtype=torch.float32)
 
         model_pts = mesh.vertices
-        self.diameter = compute_mesh_diameter(model_pts=mesh.vertices, n_sample=10000)
+        self.diameter = compute_mesh_diameter(
+            pts=torch.as_tensor(mesh.vertices, device=self.device, dtype=torch.float32), n_sample=10000, chunk_size=4096
+        )
         self.vox_size = max(self.diameter / 20.0, 0.003)
         logger.debug("self.diameter:%s, vox_size:%s", self.diameter, self.vox_size)
         self.dist_bin = self.vox_size / 2

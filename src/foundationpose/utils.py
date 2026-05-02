@@ -17,7 +17,6 @@ import cv2
 import numpy as np
 import nvdiffrast.torch as dr
 import open3d as o3d
-import scipy
 import torch
 import torch.nn.functional as F
 import trimesh
@@ -445,27 +444,21 @@ def transform_dirs(dirs: torch.Tensor, tf: torch.Tensor) -> torch.Tensor:
     return (tf[..., :3, :3] @ dirs[..., None])[..., 0]
 
 
-def compute_mesh_diameter(
-    model_pts: np.ndarray | None = None, mesh: trimesh.Trimesh | None = None, n_sample: int | None = 1000
-) -> float:
-    """Estimate a mesh or point cloud diameter."""
-    if mesh is not None:
-        u, s, _ = scipy.linalg.svd(mesh.vertices, full_matrices=False)
-        pts = u @ s
-        diameter = np.linalg.norm(pts.max(axis=0) - pts.min(axis=0))
-        return float(diameter)
+def compute_mesh_diameter(pts: torch.Tensor, n_sample: int | None = 1000, chunk_size: int = 4096) -> float:
+    """Estimate the diameter of a point cloud."""
+    if len(pts) < 2:
+        return 0.0
 
-    if model_pts is None:
-        msg = "`model_pts` is required when `mesh` is not provided."
-        raise ValueError(msg)
-    if n_sample is None:
-        pts = model_pts
-    else:
-        rng = np.random.default_rng()
-        ids = rng.choice(len(model_pts), size=min(n_sample, len(model_pts)), replace=False)
-        pts = model_pts[ids]
-    dists = np.linalg.norm(pts[None] - pts[:, None], axis=-1)
-    return float(dists.max())
+    if n_sample is not None and n_sample < len(pts):
+        ids = torch.randperm(len(pts), device=pts.device)[:n_sample]
+        pts = pts[ids]
+
+    max_distance = pts.new_tensor(0.0)
+    chunk_size = min(len(pts), chunk_size)
+    for start in range(0, len(pts), chunk_size):
+        dists = torch.cdist(pts[start : start + chunk_size], pts)
+        max_distance = torch.maximum(max_distance, dists.amax())
+    return max_distance.item()
 
 
 def compute_crop_window_tf_batch(
