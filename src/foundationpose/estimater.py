@@ -10,12 +10,12 @@
 
 import logging
 import random
+from pathlib import Path
 from typing import Literal, NamedTuple
 
 import numpy as np
 import nvdiffrast.torch as dr
 import torch
-import torch.nn.functional as F
 import trimesh
 from torch import nn
 from transformations import euler_matrix
@@ -30,7 +30,6 @@ from foundationpose.utils import (
     erode_depth,
     make_mesh_tensors,
     sample_views_icosphere,
-    to_open3d_cloud,
 )
 
 logger = logging.getLogger(__name__)
@@ -67,83 +66,55 @@ def set_seed(random_seed: int) -> None:
 class FoundationPose:
     """Register and track an object's pose from RGB-D observations."""
 
-    def __init__(
-        self,
-        model_normals: np.ndarray,
-        symmetry_tfs: torch.Tensor | None = None,
-        mesh: trimesh.Trimesh | None = None,
-        scorer: ScorePredictor | None = None,
-        refiner: PoseRefinePredictor | None = None,
-        glctx: RasterizeContext | None = None,
-        device: str | torch.device = "cuda",
-    ) -> None:
+    def __init__(self, checkpoints_dir: str | Path, amp: bool = True, device: str | torch.device = "cuda") -> None:
         """Initialize the pose estimator with mesh geometry and predictors."""
-        self.gt_pose = None
-        self.ignore_normal_flip = True
-        self.device = torch.device(device)
-
-        self.reset_object(mesh, model_normals, symmetry_tfs=symmetry_tfs)
-        self.make_rotation_grid(min_n_views=40, inplane_step=60)
-
-        self.glctx = glctx
-        self.scorer = scorer if scorer is not None else ScorePredictor()
-        self.refiner = refiner if refiner is not None else PoseRefinePredictor()
         self.pose_last = None  # Used for tracking; per the centered mesh.
+        self.device = torch.device(device)
+        self.symmetry_tfs = torch.eye(4, dtype=torch.float32, device=self.device).unsqueeze(0)
+        self.rot_grid = self.make_rotation_grid(min_n_views=40, inplane_step=60)
 
-    def reset_object(
-        self, mesh: trimesh.Trimesh, model_normals: np.ndarray, symmetry_tfs: torch.Tensor | None = None
-    ) -> None:
+        # Load submodules
+        checkpoints_dir = Path(checkpoints_dir)
+        self.scorer = ScorePredictor(checkpoints_dir=checkpoints_dir, amp=amp, device=device)
+        self.refiner = PoseRefinePredictor(checkpoints_dir=checkpoints_dir, amp=amp, device=device)
+
+        self.glctx = dr.RasterizeCudaContext(self.device)  # dr.RasterizeGLContext()
+
+    def set_object(self, mesh: trimesh.Trimesh, symmetry_tfs: torch.Tensor | None = None) -> None:
         """Rebuild mesh-derived caches for a new object model."""
-        max_xyz = mesh.vertices.max(axis=0)
-        min_xyz = mesh.vertices.min(axis=0)
-        model_center = (min_xyz + max_xyz) / 2
+        # Center mesh
+        mesh_c = mesh.copy()
+        mesh_verts = mesh.vertices
+        mesh_center = (mesh_verts.min(axis=0) + mesh_verts.max(axis=0)) / 2
+        mesh_c.apply_translation(-mesh_center)
+        self.mesh_center = torch.as_tensor(mesh_center, device=self.device, dtype=torch.float32)
 
-        self.mesh_ori = mesh.copy()
-        mesh = mesh.copy()
-        mesh.vertices = mesh.vertices - model_center.reshape(1, 3)
+        # Create and cache mesh tensors
+        self.mesh_tensors: TensorMap = make_mesh_tensors(mesh_c, self.device)
 
-        self.model_center = torch.as_tensor(model_center, device=self.device, dtype=torch.float32)
+        # Compute mesh diameter
+        self.diameter = compute_mesh_diameter(pts=self.mesh_tensors["pos"], n_sample=10000, chunk_size=4096)
 
-        model_pts = mesh.vertices
-        self.diameter = compute_mesh_diameter(
-            pts=torch.as_tensor(mesh.vertices, device=self.device, dtype=torch.float32), n_sample=10000, chunk_size=4096
-        )
-        self.vox_size = max(self.diameter / 20.0, 0.003)
-        logger.debug("self.diameter:%s, vox_size:%s", self.diameter, self.vox_size)
-        self.dist_bin = self.vox_size / 2
-        self.angle_bin = 20  # Deg
-        pcd = to_open3d_cloud(model_pts, normals=model_normals)
-        pcd = pcd.voxel_down_sample(self.vox_size)
-        self.max_xyz = np.asarray(pcd.points).max(axis=0)
-        self.min_xyz = np.asarray(pcd.points).min(axis=0)
-        self.pts = torch.tensor(np.asarray(pcd.points), dtype=torch.float32, device=self.device)
-        self.normals = F.normalize(
-            torch.tensor(np.asarray(pcd.normals), dtype=torch.float32, device=self.device), dim=-1
-        )
-
-        self.mesh = mesh
-        self.mesh_tensors: TensorMap = make_mesh_tensors(self.mesh, self.device)
-
+        # Set up symmetry transforms
         if symmetry_tfs is None:
-            self.symmetry_tfs = torch.eye(4, dtype=torch.float32, device=self.device)[None]
+            self.symmetry_tfs = torch.eye(4, dtype=torch.float32, device=self.device).unsqueeze(0)
         else:
             self.symmetry_tfs = symmetry_tfs.to(device=self.device, dtype=torch.float32)
+            self.rot_grid = self.make_rotation_grid(min_n_views=40, inplane_step=60)
 
     def get_tf_to_centered_mesh(self) -> torch.Tensor:
         """Return the transform from the original object frame to the centered mesh frame."""
         tf_to_center = torch.eye(4, dtype=torch.float32, device=self.device)
-        tf_to_center[:3, 3] = -self.model_center
+        tf_to_center[:3, 3] = -self.mesh_center
         return tf_to_center
 
     def to_device(self, device: str = "cuda:0") -> None:
         """Move cached tensors, models, and raster context to a target device."""
         for key, value in list(self.__dict__.items()):
             if torch.is_tensor(value) or isinstance(value, nn.Module):
-                logger.debug("Moving %s to device %s", key, device)
                 self.__dict__[key] = value.to(device)
 
         for key, value in self.mesh_tensors.items():
-            logger.debug("Moving %s to device %s", key, device)
             self.mesh_tensors[key] = value.to(device)
 
         if self.refiner is not None:
@@ -153,10 +124,9 @@ class FoundationPose:
         if self.glctx is not None:
             self.glctx = dr.RasterizeCudaContext(device)
 
-    def make_rotation_grid(self, min_n_views: int = 40, inplane_step: int = 60) -> None:
+    def make_rotation_grid(self, min_n_views: int = 40, inplane_step: int = 60) -> torch.Tensor:
         """Precompute a clustered rotation hypothesis grid for initialization."""
         cam_in_obs = sample_views_icosphere(n_views=min_n_views)
-        logger.debug("cam_in_obs:%s", cam_in_obs.shape)
         rot_grid: list[np.ndarray] = []
         for cam_in_ob in cam_in_obs:
             for inplane_rot in np.deg2rad(np.arange(0, 360, inplane_step)):
@@ -166,21 +136,20 @@ class FoundationPose:
                 rot_grid.append(ob_in_cam)
 
         rot_grid = np.asarray(rot_grid)
-        logger.debug("rot_grid:%s", rot_grid.shape)
         rot_grid = cluster_poses(30, 99999, rot_grid, self.symmetry_tfs.detach().cpu().numpy())
         rot_grid = np.asarray(rot_grid)
-        logger.debug("after cluster, rot_grid:%s", rot_grid.shape)
-        self.rot_grid = torch.as_tensor(rot_grid, device=self.device, dtype=torch.float32)
-        logger.debug("self.rot_grid:%s", self.rot_grid.shape)
+        return torch.as_tensor(rot_grid, device=self.device, dtype=torch.float32)
 
-    def generate_random_pose_hypo(self, K: torch.Tensor, depth: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    def generate_random_pose_hypo(
+        self, depth: torch.Tensor, mask: torch.Tensor, intrinsics_px: torch.Tensor
+    ) -> torch.Tensor:
         """Generate rotation-grid pose hypotheses centered at the estimated translation."""
         ob_in_cams = self.rot_grid.clone()
-        center = self.guess_translation(depth=depth, mask=mask, K=K)
+        center = self.guess_translation(depth=depth, mask=mask, intrinsics_px=intrinsics_px)
         ob_in_cams[:, :3, 3] = center.reshape(1, 3)
         return ob_in_cams
 
-    def guess_translation(self, depth: torch.Tensor, mask: torch.Tensor, K: torch.Tensor) -> torch.Tensor:
+    def guess_translation(self, depth: torch.Tensor, mask: torch.Tensor, intrinsics_px: torch.Tensor) -> torch.Tensor:
         """Estimate object translation from the masked depth median."""
         vs, us = torch.where(mask > 0)
         if len(us) == 0:
@@ -195,19 +164,17 @@ class FoundationPose:
             return depth.new_zeros(3)
 
         zc = torch.median(depth[valid])
-        center = (K.inverse() @ depth.new_tensor([uc, vc, 1]).reshape(3, 1)) * zc
+        center = (intrinsics_px.inverse() @ depth.new_tensor([uc, vc, 1]).reshape(3, 1)) * zc
         return center.reshape(3)
 
-    @torch.no_grad
+    @torch.no_grad()
     def register(
         self,
-        K: torch.Tensor,
-        rgb: torch.Tensor,
+        image: torch.Tensor,
         depth: torch.Tensor,
-        ob_mask: torch.Tensor,
-        ob_id: int | None = None,
-        glctx: RasterizeContext | None = None,
-        iteration: int = 5,
+        object_mask: torch.Tensor,
+        intrinsics_px: torch.Tensor,
+        iterations: int = 5,
         seed: int | None = 42,
         matching_mode: Literal["rgb_only", "rgbd_only", "both_rgbd_and_rgb"] = "rgbd_only",
         renderer_batch_size: int = 512,
@@ -223,29 +190,18 @@ class FoundationPose:
             msg = "matching_mode must be one of ['rgb_only', 'rgbd_only', 'both_rgbd_and_rgb']"
             raise ValueError(msg)
 
-        if self.glctx is None:
-            if glctx is None:
-                self.glctx = dr.RasterizeCudaContext(self.device)  # dr.RasterizeGLContext()
-            else:
-                self.glctx = glctx
-
-        K = torch.as_tensor(K, device=self.device, dtype=torch.float32)
-        rgb = torch.as_tensor(rgb, device=self.device, dtype=torch.float32)
+        image = torch.as_tensor(image, device=self.device, dtype=torch.float32)
         depth = torch.as_tensor(depth, device=self.device, dtype=torch.float32)
-        ob_mask = torch.as_tensor(ob_mask, device=self.device, dtype=torch.float32)
+        object_mask = torch.as_tensor(object_mask, device=self.device, dtype=torch.float32)
+        intrinsics_px = torch.as_tensor(intrinsics_px, device=self.device, dtype=torch.float32)
 
         depth = erode_depth(depth, radius=2)
         depth = bilateral_filter_depth(depth, radius=2)
 
-        normal_map = None
-        valid = (depth >= 0.001) & (ob_mask > 0)
-
-        center = self.guess_translation(depth=depth, mask=ob_mask, K=K)
-
-        if valid.sum() < 4:
-            logger.warning("valid too small, return")
+        if ((depth >= 0.001) & (object_mask > 0)).sum() < 4:
+            logger.warning("too few valid points, return")
             pose = torch.eye(4, dtype=torch.float32, device=self.device)
-            pose[:3, 3] = center
+            pose[:3, 3] = self.guess_translation(depth=depth, mask=object_mask, intrinsics_px=intrinsics_px)
             poses = pose.reshape(1, 4, 4)
             scores = depth.new_zeros(1)
             self.pose_last = poses[0]
@@ -257,31 +213,21 @@ class FoundationPose:
                 scores=scores,
             )
 
-        self.H, self.W = depth.shape[:2]
-        self.K = K
-        self.ob_id = ob_id
-        self.ob_mask = ob_mask
+        poses = self.generate_random_pose_hypo(depth=depth, mask=object_mask, intrinsics_px=intrinsics_px)
 
-        poses = self.generate_random_pose_hypo(K=K, depth=depth, mask=ob_mask)
-        logger.debug("poses:%s", poses.shape)
-
-        poses[:, :3, 3] = center.reshape(1, 3)
-
-        xyz_map = depth2xyzmap(depth, K)
+        xyz_map = depth2xyzmap(depth, intrinsics_px)
         if matching_mode == "both_rgbd_and_rgb":
             poses_list: list[torch.Tensor] = [
                 self.refiner.predict(
-                    mesh=self.mesh,
                     mesh_tensors=self.mesh_tensors,
-                    rgb=rgb,
+                    image=image,
                     depth=depth,
-                    K=K,
+                    intrinsics_px=intrinsics_px,
                     ob_in_cams=poses,
-                    normal_map=normal_map,
                     xyz_map=xyz_map,
                     glctx=self.glctx,
                     mesh_diameter=self.diameter,
-                    iteration=iteration,
+                    iterations=iterations,
                     rgb_only=rgb_only_i,
                     renderer_batch_size=renderer_batch_size,
                 )
@@ -290,26 +236,23 @@ class FoundationPose:
             poses = torch.cat(poses_list, dim=0)
         else:
             poses = self.refiner.predict(
-                mesh=self.mesh,
                 mesh_tensors=self.mesh_tensors,
-                rgb=rgb,
+                image=image,
                 depth=depth,
-                K=K,
+                intrinsics_px=intrinsics_px,
                 ob_in_cams=poses,
-                normal_map=normal_map,
                 xyz_map=xyz_map,
                 glctx=self.glctx,
                 mesh_diameter=self.diameter,
-                iteration=iteration,
+                iterations=iterations,
                 rgb_only=(matching_mode == "rgb_only"),
                 renderer_batch_size=renderer_batch_size,
             )
 
         scores = self.scorer.predict(
-            mesh=self.mesh,
-            rgb=rgb,
+            image=image,
             depth=depth,
-            K=K,
+            intrinsics_px=intrinsics_px,
             ob_in_cams=poses,
             mesh_tensors=self.mesh_tensors,
             glctx=self.glctx,
@@ -319,10 +262,8 @@ class FoundationPose:
         )
 
         ids = scores.argsort(descending=True)
-        logger.debug("sort ids:%s", ids)
         scores = scores[ids]
         poses = poses[ids]
-        logger.debug("sorted scores:%s", scores)
 
         self.pose_last = poses[0]
         poses_in_original_frame = poses @ self.get_tf_to_centered_mesh()
@@ -333,8 +274,10 @@ class FoundationPose:
             scores=scores,
         )
 
-    @torch.no_grad
-    def track_one(self, rgb: torch.Tensor, depth: torch.Tensor, K: torch.Tensor, iteration: int) -> torch.Tensor:
+    @torch.no_grad()
+    def track_one(
+        self, image: torch.Tensor, depth: torch.Tensor, intrinsics_px: torch.Tensor, iterations: int
+    ) -> torch.Tensor:
         """Refine the previous pose estimate on a subsequent RGB-D frame."""
         if self.pose_last is None:
             logger.error("Please init pose by register first")
@@ -345,17 +288,15 @@ class FoundationPose:
         depth = bilateral_filter_depth(depth, radius=2)
 
         pose = self.refiner.predict(
-            mesh=self.mesh,
             mesh_tensors=self.mesh_tensors,
-            rgb=rgb,
+            image=image,
             depth=depth,
-            K=K,
+            intrinsics_px=intrinsics_px,
             ob_in_cams=self.pose_last.reshape(1, 4, 4),
-            normal_map=None,
-            xyz_map=depth2xyzmap(depth, K),
+            xyz_map=depth2xyzmap(depth, intrinsics_px),
             mesh_diameter=self.diameter,
             glctx=self.glctx,
-            iteration=iteration,
+            iterations=iterations,
         )
 
         self.pose_last = pose

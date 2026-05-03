@@ -13,13 +13,12 @@ from pathlib import Path
 
 import nvdiffrast.torch as dr
 import torch
-import trimesh
 from omegaconf import OmegaConf
 
 from foundationpose.learning.datasets.h5_dataset import PoseRefinePairH5Dataset
 from foundationpose.learning.models.refine_network import RefineNet
 from foundationpose.pytorch3d.transforms import rotation_6d_to_matrix, so3_exp_map
-from foundationpose.utils import egocentric_delta_pose_to_pose, make_mesh_tensors, transform_pts
+from foundationpose.utils import egocentric_delta_pose_to_pose, transform_pts
 
 from .predict_score import make_crop_data_batch
 
@@ -79,23 +78,20 @@ class PoseRefinePredictor:
     @torch.inference_mode()
     def predict(  # noqa: PLR0912, PLR0915
         self,
-        rgb: torch.Tensor,
+        image: torch.Tensor,
         depth: torch.Tensor,
-        K: torch.Tensor,
+        intrinsics_px: torch.Tensor,
         ob_in_cams: torch.Tensor,
         xyz_map: torch.Tensor,
-        normal_map: torch.Tensor | None = None,
-        mesh: trimesh.Trimesh | None = None,
-        mesh_tensors: TensorMap | None = None,
+        mesh_tensors: TensorMap,
+        mesh_diameter: float,
         glctx: RasterizeContext | None = None,
-        mesh_diameter: float | None = None,
-        iteration: int = 5,
+        iterations: int = 5,
         rgb_only: bool = False,
         renderer_batch_size: int = 512,
     ) -> torch.Tensor:
         """Refine candidate object poses for a single RGB-D observation."""
         bs = 1024
-        mesh_centered = mesh
         crop_ratio = self.cfg["crop_ratio"]
         use_normal = self.cfg["use_normal"]
         trans_normalizer = self.cfg["trans_normalizer"]
@@ -106,41 +102,32 @@ class PoseRefinePredictor:
         input_resize = self.cfg["input_resize"]
 
         # move to device/dtype
-        rgb_tensor = rgb.to(device=self.device, dtype=torch.float32)
+        image_tensor = image.to(device=self.device, dtype=torch.float32)
         depth_tensor = depth.to(device=self.device, dtype=torch.float32)
-        K = K.to(device=self.device, dtype=torch.float32)
+        intrinsics_px = intrinsics_px.to(device=self.device, dtype=torch.float32)
         B_in_cams = ob_in_cams.to(device=self.device, dtype=torch.float32)
         xyz_map_tensor = xyz_map.to(device=self.device, dtype=torch.float32)
-        normal_map = normal_map.to(device=self.device, dtype=torch.float32) if normal_map is not None else None
-
-        if not use_normal:
-            normal_map = None
-        if mesh_tensors is None:
-            mesh_tensors = make_mesh_tensors(mesh_centered, self.device)
 
         if rgb_only:
             depth_tensor = torch.zeros_like(depth_tensor)
             xyz_map_tensor = torch.zeros_like(xyz_map_tensor)
-            normal_map = None
 
         if not isinstance(trans_normalizer, float):
             trans_normalizer = torch.as_tensor(list(trans_normalizer), device=self.device, dtype=torch.float32).reshape(
                 1, 3
             )
 
-        for _ in range(iteration):
+        for _ in range(iterations):
             pose_data = make_crop_data_batch(
-                mesh=mesh_centered,
                 mesh_diameter=mesh_diameter,
                 ob_in_cams=B_in_cams,
-                rgb=rgb_tensor,
-                K=K,
+                image=image_tensor,
+                intrinsics_px=intrinsics_px,
                 use_normal=use_normal,
                 render_size=input_resize,
                 crop_ratio=crop_ratio,
                 dataset=self.dataset,
                 xyz_map=xyz_map_tensor,
-                normal_map=normal_map,
                 glctx=glctx,
                 mesh_tensors=mesh_tensors,
                 device=self.device,

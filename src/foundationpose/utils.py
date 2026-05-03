@@ -16,7 +16,6 @@ from typing import TYPE_CHECKING, Literal, TypeAlias
 import cv2
 import numpy as np
 import nvdiffrast.torch as dr
-import open3d as o3d
 import torch
 import torch.nn.functional as F
 import trimesh
@@ -54,7 +53,7 @@ def make_mesh_tensors(
                 scale = 1 / max_size * max_tex_size
                 img = cv2.resize(img, fx=scale, fy=scale, dsize=None)
         mesh_tensors["tex"] = torch.as_tensor(img, device=device, dtype=torch.float32)[None] / 255.0
-        mesh_tensors["uv_idx"] = torch.as_tensor(mesh.faces, device=device, dtype=torch.int)
+        mesh_tensors["uv_idx"] = torch.as_tensor(mesh.faces, device=device, dtype=torch.long)
         uv = torch.as_tensor(mesh.visual.uv, device=device, dtype=torch.float32)
         uv[:, 1] = 1 - uv[:, 1]
         mesh_tensors["uv"] = uv
@@ -69,23 +68,23 @@ def make_mesh_tensors(
     mesh_tensors.update(
         {
             "pos": torch.tensor(mesh.vertices, device=device, dtype=torch.float32),
-            "faces": torch.tensor(mesh.faces, device=device, dtype=torch.int),
+            "faces": torch.tensor(mesh.faces, device=device, dtype=torch.long),
             "vnormals": torch.tensor(mesh.vertex_normals, device=device, dtype=torch.float32),
         }
     )
     return mesh_tensors
 
 
+@torch.no_grad()
 def nvdiffrast_render(  # noqa: PLR0912, PLR0915
     ob_in_cams: torch.Tensor,
-    K: torch.Tensor | None = None,
+    mesh_tensors: MeshTensorMap,
+    intrinsics_px: torch.Tensor | None = None,
     H: int | None = None,
     W: int | None = None,
     glctx: RasterizeContext | None = None,
     context: Literal["cuda", "gl"] = "cuda",
     get_normal: bool = False,
-    mesh_tensors: MeshTensorMap | None = None,
-    mesh: trimesh.Trimesh | None = None,
     projection_mat: torch.Tensor | None = None,
     bbox2d: torch.Tensor | None = None,
     output_size: Sequence[int] | np.ndarray | None = None,
@@ -95,12 +94,11 @@ def nvdiffrast_render(  # noqa: PLR0912, PLR0915
     light_pos: np.ndarray | None = None,
     w_ambient: float = 0.8,
     w_diffuse: float = 0.5,
-    extra: dict[str, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """Render a mesh with nvdiffrast without gradient support.
 
     Args:
-        K: Camera intrinsics with shape `(3, 3)`.
+        intrinsics_px: Camera intrinsics with shape `(3, 3)`.
         H: Output image height.
         W: Output image width.
         ob_in_cams: Object poses in OpenCV camera coordinates with shape `(N, 4, 4)`.
@@ -118,7 +116,6 @@ def nvdiffrast_render(  # noqa: PLR0912, PLR0915
         light_pos: Optional light position in camera space.
         w_ambient: Ambient lighting weight.
         w_diffuse: Diffuse lighting weight.
-        extra: Output dictionary populated with auxiliary tensors.
     """
     device = ob_in_cams.device
 
@@ -130,21 +127,16 @@ def nvdiffrast_render(  # noqa: PLR0912, PLR0915
         else:
             raise NotImplementedError
 
-    if mesh_tensors is None:
-        if mesh is None:
-            msg = "`mesh` is required when `mesh_tensors` is not provided."
-            raise ValueError(msg)
-        mesh_tensors = make_mesh_tensors(mesh, device=device)
     pos = mesh_tensors["pos"]
     vnormals = mesh_tensors["vnormals"]
     pos_idx = mesh_tensors["faces"]
     has_tex = "tex" in mesh_tensors
 
     if projection_mat is None:
-        if K is None or H is None or W is None:
-            msg = "`K`, `H`, and `W` are required when `projection_mat` is not provided."
+        if intrinsics_px is None or H is None or W is None:
+            msg = "`intrinsics_px`, `H`, and `W` are required when `projection_mat` is not provided."
             raise ValueError(msg)
-        projection_mat = projection_matrix_from_intrinsics(K, height=H, width=W, znear=0.001, zfar=100)
+        projection_mat = projection_matrix_from_intrinsics(intrinsics_px, height=H, width=W, znear=0.001, zfar=100)
     if output_size is None:
         if H is None or W is None:
             msg = "`H` and `W` are required when `output_size` is not provided."
@@ -154,8 +146,6 @@ def nvdiffrast_render(  # noqa: PLR0912, PLR0915
         light_dir = DEFAULT_LIGHT_DIR
     if light_pos is None:
         light_pos = DEFAULT_LIGHT_POS
-    if extra is None:
-        extra = {}
 
     ob_in_glcams = torch.as_tensor(glcam_in_cvcam, device=device, dtype=torch.float32)[None] @ ob_in_cams
     projection_mat = projection_mat.reshape(-1, 4, 4)
@@ -215,23 +205,7 @@ def nvdiffrast_render(  # noqa: PLR0912, PLR0915
     color = color * torch.clamp(rast_out[..., -1:], 0, 1)  # Mask out background using alpha
     color = torch.flip(color, dims=[1])  # Flip Y coordinates
     depth = torch.flip(depth, dims=[1])
-    extra["xyz_map"] = torch.flip(xyz_map, dims=[1])
-    return color, depth, normal_map
-
-
-def to_open3d_cloud(
-    points: np.ndarray, colors: np.ndarray | None = None, normals: np.ndarray | None = None
-) -> o3d.geometry.PointCloud:
-    """Build an Open3D point cloud from point, color, and normal arrays."""
-    cloud = o3d.geometry.PointCloud()
-    cloud.points = o3d.utility.Vector3dVector(points.astype(np.float64))
-    if colors is not None:
-        if colors.max() > 1:
-            colors = colors / 255.0
-        cloud.colors = o3d.utility.Vector3dVector(colors.astype(np.float64))
-    if normals is not None:
-        cloud.normals = o3d.utility.Vector3dVector(normals.astype(np.float64))
-    return cloud
+    return color, depth, normal_map, torch.flip(xyz_map, dims=[1])
 
 
 if wp is not None:
@@ -356,7 +330,7 @@ if wp is not None:
         return wp.to_torch(out_wp)
 
 
-def depth2xyzmap(depth: torch.Tensor, K: torch.Tensor) -> torch.Tensor:
+def depth2xyzmap(depth: torch.Tensor, intrinsics_px: torch.Tensor) -> torch.Tensor:
     """Project a depth map into an XYZ map using camera intrinsics."""
     invalid_mask = depth < 0.001
     H, W = depth.shape[:2]
@@ -367,8 +341,8 @@ def depth2xyzmap(depth: torch.Tensor, K: torch.Tensor) -> torch.Tensor:
     us = us.reshape(-1)
 
     zs = depth[vs, us]
-    xs = (us - K[0, 2]) * zs / K[0, 0]
-    ys = (vs - K[1, 2]) * zs / K[1, 1]
+    xs = (us - intrinsics_px[0, 2]) * zs / intrinsics_px[0, 0]
+    ys = (vs - intrinsics_px[1, 2]) * zs / intrinsics_px[1, 1]
     pts = torch.stack((xs.reshape(-1), ys.reshape(-1), zs.reshape(-1)), 1)  # (N,3)
     xyz_map = depth.new_zeros((H, W, 3))
     xyz_map[vs, us] = pts
@@ -464,7 +438,7 @@ def compute_mesh_diameter(pts: torch.Tensor, n_sample: int | None = 1000, chunk_
 def compute_crop_window_tf_batch(
     pts: torch.Tensor | None = None,
     poses: torch.Tensor | None = None,
-    K: torch.Tensor | None = None,
+    intrinsics_px: torch.Tensor | None = None,
     crop_ratio: float = 1.2,
     out_size: Sequence[int] | torch.Tensor | np.ndarray | None = None,
     method: str = "min_box",
@@ -492,8 +466,8 @@ def compute_crop_window_tf_batch(
         new_tf[:, 1, 1] = out_size[1] / (bottom - top)
         return new_tf @ tf
 
-    if poses is None or K is None:
-        msg = "`poses` and `K` are required."
+    if poses is None or intrinsics_px is None:
+        msg = "`poses` and `intrinsics_px` are required."
         raise ValueError(msg)
     B = len(poses)
     if method != "box_3d":
@@ -508,7 +482,7 @@ def compute_crop_window_tf_batch(
         [0, 0, 0, radius, 0, 0, -radius, 0, 0, 0, radius, 0, 0, -radius, 0], device=poses.device, dtype=poses.dtype
     ).reshape(-1, 3)
     pts = poses[:, :3, 3].reshape(-1, 1, 3) + offsets.reshape(1, -1, 3)
-    projected = (K @ pts.reshape(-1, 3).T).T
+    projected = (intrinsics_px @ pts.reshape(-1, 3).T).T
     uvs = projected[:, :2] / projected[:, 2:3]
     uvs = uvs.reshape(B, -1, 2)
     center = uvs[:, 0]  # (B,2)
@@ -521,7 +495,7 @@ def compute_crop_window_tf_batch(
 
 
 def projection_matrix_from_intrinsics(
-    K: torch.Tensor,
+    intrinsics_px: torch.Tensor,
     height: int,
     width: int,
     znear: float,
@@ -534,7 +508,7 @@ def projection_matrix_from_intrinsics(
     1) https://strawlab.org/2011/11/05/augmented-reality-with-OpenGL
     2) https://github.com/strawlab/opengl-hz/blob/master/src/calib_test_utils.py
 
-    :param K: 3x3 ndarray with the intrinsic camera matrix.
+    :param intrinsics_px: 3x3 ndarray with the intrinsic camera matrix.
     :param x0 The X coordinate of the camera image origin (typically 0).
     :param y0: The Y coordinate of the camera image origin (typically 0).
     :param w: Image width.
@@ -557,6 +531,7 @@ def projection_matrix_from_intrinsics(
 
     # Draw our images upside down, so that all the pixel-based coordinate
     # systems are the same.
+    K = intrinsics_px
     if window_coords == "y_up":
         proj = K.new_tensor(
             [
