@@ -53,7 +53,7 @@ def make_mesh_tensors(
                 scale = 1 / max_size * max_tex_size
                 img = cv2.resize(img, fx=scale, fy=scale, dsize=None)
         mesh_tensors["tex"] = torch.as_tensor(img, device=device, dtype=torch.float32)[None] / 255.0
-        mesh_tensors["uv_idx"] = torch.as_tensor(mesh.faces, device=device, dtype=torch.long)
+        mesh_tensors["uv_idx"] = torch.as_tensor(mesh.faces, device=device, dtype=torch.int32)  # nvdiffrast needs int32
         uv = torch.as_tensor(mesh.visual.uv, device=device, dtype=torch.float32)
         uv[:, 1] = 1 - uv[:, 1]
         mesh_tensors["uv"] = uv
@@ -68,7 +68,7 @@ def make_mesh_tensors(
     mesh_tensors.update(
         {
             "pos": torch.tensor(mesh.vertices, device=device, dtype=torch.float32),
-            "faces": torch.tensor(mesh.faces, device=device, dtype=torch.long),
+            "faces": torch.tensor(mesh.faces, device=device, dtype=torch.int32),  # nvdiffrast needs int32
             "vnormals": torch.tensor(mesh.vertex_normals, device=device, dtype=torch.float32),
         }
     )
