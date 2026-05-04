@@ -254,6 +254,7 @@ class FoundationPose:
             depth=depth,
             intrinsics_px=intrinsics_px,
             ob_in_cams=poses,
+            xyz_map=xyz_map,
             mesh_tensors=self.mesh_tensors,
             glctx=self.glctx,
             mesh_diameter=self.diameter,

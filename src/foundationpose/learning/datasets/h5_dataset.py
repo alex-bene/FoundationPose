@@ -97,6 +97,7 @@ class PairH5Dataset(Dataset):
         batch.Ks = batch.Ks.cuda()
 
         if batch.xyz_mapAs is None:
+            print("SHOULD NOT HAPPEN")  # noqa: T201
             depthAs_ori = kornia.geometry.transform.warp_perspective(
                 batch.depthAs.cuda().expand(bs, -1, -1, -1),
                 crop_to_oris,
@@ -120,6 +121,7 @@ class PairH5Dataset(Dataset):
             batch.xyz_mapAs[invalid.expand(bs, 3, -1, -1)] = 0
 
         if batch.xyz_mapBs is None:
+            print("SHOULD NOT HAPPEN")  # noqa: T201
             depthBs_ori = kornia.geometry.transform.warp_perspective(
                 batch.depthBs.cuda().expand(bs, -1, -1, -1),
                 crop_to_oris,
@@ -172,6 +174,7 @@ class TripletH5Dataset(PairH5Dataset):
         batch.Ks = batch.Ks.cuda()
 
         if batch.xyz_mapAs is None:
+            print("SHOULD NOT HAPPEN")  # noqa: T201
             depthAs_ori = kornia.geometry.transform.warp_perspective(
                 batch.depthAs.cuda().expand(bs, -1, -1, -1),
                 crop_to_oris,
@@ -194,6 +197,7 @@ class TripletH5Dataset(PairH5Dataset):
             batch.xyz_mapAs[invalid.expand(bs, 3, -1, -1)] = 0
 
         if batch.xyz_mapBs is None:
+            print("SHOULD NOT HAPPEN")  # noqa: T201
             depthBs_ori = kornia.geometry.transform.warp_perspective(
                 batch.depthBs.cuda().expand(bs, -1, -1, -1),
                 crop_to_oris,
