@@ -216,51 +216,28 @@ class FoundationPose:
         poses = self.generate_random_pose_hypo(depth=depth, mask=object_mask, intrinsics_px=intrinsics_px)
 
         xyz_map = depth2xyzmap(depth, intrinsics_px)
+        submodels_kwargs = {
+            "mesh_tensors": self.mesh_tensors,
+            "image": image,
+            "depth": depth,
+            "intrinsics_px": intrinsics_px,
+            "ob_in_cams": poses,
+            "xyz_map": xyz_map,
+            "glctx": self.glctx,
+            "mesh_diameter": self.diameter,
+            "renderer_batch_size": renderer_batch_size,
+        }
         if matching_mode == "both_rgbd_and_rgb":
-            poses_list: list[torch.Tensor] = [
-                self.refiner.predict(
-                    mesh_tensors=self.mesh_tensors,
-                    image=image,
-                    depth=depth,
-                    intrinsics_px=intrinsics_px,
-                    ob_in_cams=poses,
-                    xyz_map=xyz_map,
-                    glctx=self.glctx,
-                    mesh_diameter=self.diameter,
-                    iterations=iterations,
-                    rgb_only=rgb_only_i,
-                    renderer_batch_size=renderer_batch_size,
-                )
-                for rgb_only_i in [False, True]
-            ]  # [poses_depth, poses_rgb]
-            poses = torch.cat(poses_list, dim=0)
+            poses_depth = self.refiner.predict(rgb_only=False, iterations=iterations, **submodels_kwargs)
+            poses_rgb = self.refiner.predict(rgb_only=True, iterations=iterations, **submodels_kwargs)
+            poses = torch.cat([poses_depth, poses_rgb], dim=0)
         else:
             poses = self.refiner.predict(
-                mesh_tensors=self.mesh_tensors,
-                image=image,
-                depth=depth,
-                intrinsics_px=intrinsics_px,
-                ob_in_cams=poses,
-                xyz_map=xyz_map,
-                glctx=self.glctx,
-                mesh_diameter=self.diameter,
-                iterations=iterations,
-                rgb_only=(matching_mode == "rgb_only"),
-                renderer_batch_size=renderer_batch_size,
+                rgb_only=(matching_mode == "rgb_only"), iterations=iterations, **submodels_kwargs
             )
 
-        scores = self.scorer.predict(
-            image=image,
-            depth=depth,
-            intrinsics_px=intrinsics_px,
-            ob_in_cams=poses,
-            xyz_map=xyz_map,
-            mesh_tensors=self.mesh_tensors,
-            glctx=self.glctx,
-            mesh_diameter=self.diameter,
-            rgb_only=(matching_mode == "rgb_only"),
-            renderer_batch_size=renderer_batch_size,
-        )
+        submodels_kwargs["ob_in_cams"] = poses
+        scores = self.scorer.predict(rgb_only=(matching_mode == "rgb_only"), **submodels_kwargs)
 
         ids = scores.argsort(descending=True)
         scores = scores[ids]

@@ -423,6 +423,7 @@ def compute_mesh_diameter(pts: torch.Tensor, n_sample: int | None = 1000, chunk_
     if len(pts) < 2:
         return 0.0
 
+    pts = torch.tensor(pts, dtype=torch.float32, device="cuda")
     if n_sample is not None and n_sample < len(pts):
         ids = torch.randperm(len(pts), device=pts.device)[:n_sample]
         pts = pts[ids]
@@ -436,7 +437,6 @@ def compute_mesh_diameter(pts: torch.Tensor, n_sample: int | None = 1000, chunk_
 
 
 def compute_crop_window_tf_batch(
-    pts: torch.Tensor | None = None,
     poses: torch.Tensor | None = None,
     intrinsics_px: torch.Tensor | None = None,
     crop_ratio: float = 1.2,

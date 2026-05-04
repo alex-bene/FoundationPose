@@ -41,7 +41,6 @@ def make_crop_data_batch(
     depth: torch.Tensor | None = None,
     xyz_map: torch.Tensor | None = None,
     glctx: RasterizeContext | None = None,
-    device: str | torch.device = "cuda",
     renderer_batch_size: int = 512,
 ) -> BatchPoseData:
     """Build a score-model batch from image crops and rendered views."""
@@ -49,18 +48,8 @@ def make_crop_data_batch(
     H, W = image.shape[:2]
     method = "box_3d"
 
-    poseAs = ob_in_cams.to(dtype=torch.float32, device=device)
-    image = image.to(dtype=torch.float32, device=device)
-    depth = depth.to(dtype=torch.float32, device=device) if depth is not None else None
-    xyz_map = xyz_map.to(dtype=torch.float32, device=device) if xyz_map is not None else None
-    intrinsics_px = intrinsics_px.to(dtype=torch.float32, device=device)
-    mesh_tensors = (
-        {key: value.to(device=device) for key, value in mesh_tensors.items()} if mesh_tensors is not None else None
-    )
-
     tf_to_crops = compute_crop_window_tf_batch(
-        pts=mesh_tensors["pos"],
-        poses=poseAs,
+        poses=ob_in_cams,
         intrinsics_px=intrinsics_px,
         crop_ratio=crop_ratio,
         out_size=(render_size[1], render_size[0]),
@@ -68,15 +57,13 @@ def make_crop_data_batch(
         mesh_diameter=mesh_diameter,
     )
 
-    bbox2d_crop = torch.tensor(
-        [0, 0, render_size[0] - 1, render_size[1] - 1], device=device, dtype=torch.float32
-    ).reshape(2, 2)
+    bbox2d_crop = ob_in_cams.new_tensor([0, 0, render_size[0] - 1, render_size[1] - 1]).reshape(2, 2)
     bbox2d_ori = transform_pts(bbox2d_crop, tf_to_crops.inverse()[:, None]).reshape(-1, 4)
 
     image_rs, depth_rs, normal_rs, xyz_map_rs = [], [], [], []
     for b in range(0, B, renderer_batch_size):
         image_r, depth_r, normal_r, xyz_map_r = nvdiffrast_render(
-            ob_in_cams=poseAs[b : b + renderer_batch_size],
+            ob_in_cams=ob_in_cams[b : b + renderer_batch_size],
             intrinsics_px=intrinsics_px,
             H=H,
             W=W,
@@ -126,13 +113,13 @@ def make_crop_data_batch(
         )
 
     ## XYZ Map
-    xyz_mapAs = xyz_map_rs
-    if xyz_map_rs.shape[-2:] != render_size:
-        xyz_mapAs = kornia.geometry.transform.warp_perspective(
-            xyz_map_rs, tf_to_crops, dsize=render_size, mode="nearest", align_corners=False
-        )
+    xyz_mapAs = xyz_map_rs if xyz_map is not None else None
     xyz_mapBs = None
     if xyz_map is not None:
+        if xyz_map_rs.shape[-2:] != render_size:
+            xyz_mapAs = kornia.geometry.transform.warp_perspective(
+                xyz_map_rs, tf_to_crops, dsize=render_size, mode="nearest", align_corners=False
+            )
         xyz_mapBs = kornia.geometry.transform.warp_perspective(
             xyz_map.permute(2, 0, 1)[None].expand(B, -1, -1, -1),
             tf_to_crops,
@@ -164,12 +151,12 @@ def make_crop_data_batch(
         depthBs=depthBs,
         normalAs=normalAs,
         normalBs=normalBs,
-        poseA=poseAs,
+        poseA=ob_in_cams,
         xyz_mapAs=xyz_mapAs,
         xyz_mapBs=xyz_mapBs,
         tf_to_crops=tf_to_crops,
         Ks=intrinsics_px.reshape(1, 3, 3).expand(B, 3, 3),
-        mesh_diameters=torch.ones((B), dtype=torch.float32, device=device) * mesh_diameter,
+        mesh_diameters=ob_in_cams.new_ones(B) * mesh_diameter,
     )
     return dataset.transform_batch(pose_data, H_ori=H, W_ori=W)
 
@@ -203,7 +190,7 @@ class ScorePredictor:
 
         logger.info("[ScorePredictor] self.cfg:\n%s", OmegaConf.to_yaml(self.cfg))
 
-        self.dataset = ScoreMultiPairH5Dataset(cfg=self.cfg, mode="test", h5_file=None, max_num_key=1)
+        self.dataset = ScoreMultiPairH5Dataset(cfg=self.cfg, mode="test", h5_file=None)
         self.model = ScoreNetMultiPair(use_batch_norm=self.cfg["use_BN"], c_in=self.cfg["c_in"]).to(self.device)
 
         ckpt = torch.load(ckpt_dir)
@@ -232,8 +219,13 @@ class ScorePredictor:
         # move to device/dtype
         image = image.to(device=self.device, dtype=torch.float32)
         depth = depth.to(device=self.device, dtype=torch.float32)
+        xyz_map = xyz_map.to(device=self.device, dtype=torch.float32)
         intrinsics_px = intrinsics_px.to(device=self.device, dtype=torch.float32)
         ob_in_cams = ob_in_cams.to(device=self.device, dtype=torch.float32)
+
+        if rgb_only:
+            depth = None
+            xyz_map = None
 
         pose_data = make_crop_data_batch(
             mesh_diameter=mesh_diameter,
@@ -248,15 +240,12 @@ class ScorePredictor:
             xyz_map=xyz_map,
             glctx=glctx,
             mesh_tensors=mesh_tensors,
-            device=self.device,
             renderer_batch_size=renderer_batch_size,
         )
 
         if rgb_only:
-            pose_data.depthAs = torch.zeros_like(pose_data.depthAs)
-            pose_data.depthBs = torch.zeros_like(pose_data.depthBs)
-            pose_data.xyz_mapAs = torch.zeros_like(pose_data.xyz_mapAs)
-            pose_data.xyz_mapBs = torch.zeros_like(pose_data.xyz_mapBs)
+            pose_data.xyz_mapAs = torch.zeros_like(pose_data.rgbAs)
+            pose_data.xyz_mapBs = torch.zeros_like(pose_data.rgbBs)
 
         def find_best_among_pairs(pose_data: BatchPoseData) -> tuple[torch.Tensor, torch.Tensor]:
             ids = []

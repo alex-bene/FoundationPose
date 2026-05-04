@@ -109,8 +109,10 @@ class PoseRefinePredictor:
         xyz_map_tensor = xyz_map.to(device=self.device, dtype=torch.float32)
 
         if rgb_only:
-            depth_tensor = torch.zeros_like(depth_tensor)
-            xyz_map_tensor = torch.zeros_like(xyz_map_tensor)
+            depth_tensor *= 0
+            # no idea why, but doing something like `xyz_map_tensor = torch.zeros_like(xyz_map_tensor)`
+            # gives different results in the end
+            xyz_map_tensor *= 0
 
         if not isinstance(trans_normalizer, float):
             trans_normalizer = torch.as_tensor(list(trans_normalizer), device=self.device, dtype=torch.float32).reshape(
@@ -130,8 +132,8 @@ class PoseRefinePredictor:
                 xyz_map=xyz_map_tensor,
                 glctx=glctx,
                 mesh_tensors=mesh_tensors,
-                device=self.device,
                 renderer_batch_size=renderer_batch_size,
+                depth=depth_tensor,
             )
             B_in_cams = []
             for b in range(0, pose_data.rgbAs.shape[0], bs):
