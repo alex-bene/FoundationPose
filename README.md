@@ -2,7 +2,7 @@
 
 [![pre-commit.ci status](https://results.pre-commit.ci/badge/github/alex-bene/FoundationPose/main.svg)](https://results.pre-commit.ci/latest/github/alex-bene/FoundationPose/main)
 [![Development Status](https://img.shields.io/badge/status-beta-orange)](https://github.com/alex-bene/FoundationPose)
-[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
 
 [[Paper]](https://arxiv.org/abs/2312.08344) [[Original implementation]](https://github.com/NVlabs/FoundationPose) [[Website]](https://nvlabs.github.io/FoundationPose/)

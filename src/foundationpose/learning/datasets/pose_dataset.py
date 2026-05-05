@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import contextlib
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Self
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     import torch
@@ -62,7 +62,7 @@ class BatchPoseData:
                     self.__dict__[k] = self.__dict__[k].pin_memory()
         return self
 
-    def cuda(self) -> Self:
+    def cuda(self) -> BatchPoseData:
         """Move all tensor attributes to CUDA device."""
         for k in self.__dict__:
             if self.__dict__[k] is not None:
