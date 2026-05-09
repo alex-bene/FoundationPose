@@ -24,7 +24,6 @@ import warp as wp
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-wp.init()
 
 logger = logging.getLogger(__name__)
 
@@ -208,126 +207,123 @@ def nvdiffrast_render(  # noqa: PLR0912, PLR0915
     return color, depth, normal_map, torch.flip(xyz_map, dims=[1])
 
 
-if wp is not None:
+@wp.kernel(enable_backward=False)
+def bilateral_filter_depth_kernel(  # noqa: PLR0912
+    depth: wp.array(dtype=float, ndim=2),  # pyright: ignore reportInvalidType
+    out: wp.array(dtype=float, ndim=2),  # pyright: ignore reportInvalidType
+    radius: int,
+    zfar: float,
+    sigmaD: float,
+    sigmaR: float,
+) -> None:
+    """Warp kernel for bilateral filtering a depth map."""
+    h, w = wp.tid()
+    H = depth.shape[0]
+    W = depth.shape[1]
+    if w >= W or h >= H:
+        return
+    out[h, w] = 0.0
+    mean_depth = float(0)
+    num_valid = int(0.0)
+    for u in range(w - radius, w + radius + 1):
+        if u < 0 or u >= W:
+            continue
+        for v in range(h - radius, h + radius + 1):
+            if v < 0 or v >= H:
+                continue
+            cur_depth = depth[v, u]
+            if cur_depth >= 0.001 and cur_depth < zfar:
+                num_valid += 1
+                mean_depth += cur_depth
+    if num_valid == 0:
+        return
+    mean_depth /= float(num_valid)
 
-    @wp.kernel(enable_backward=False)
-    def bilateral_filter_depth_kernel(  # noqa: PLR0912
-        depth: wp.array(dtype=float, ndim=2),  # pyright: ignore reportInvalidType
-        out: wp.array(dtype=float, ndim=2),  # pyright: ignore reportInvalidType
-        radius: int,
-        zfar: float,
-        sigmaD: float,
-        sigmaR: float,
-    ) -> None:
-        """Warp kernel for bilateral filtering a depth map."""
-        h, w = wp.tid()
-        H = depth.shape[0]
-        W = depth.shape[1]
-        if w >= W or h >= H:
-            return
+    depthCenter = depth[h, w]
+    sum_weight = float(0)
+    depth_sum = float(0)
+    for u in range(w - radius, w + radius + 1):
+        if u < 0 or u >= W:
+            continue
+        for v in range(h - radius, h + radius + 1):
+            if v < 0 or v >= H:
+                continue
+            cur_depth = depth[v, u]
+            if cur_depth >= 0.001 and cur_depth < zfar and abs(cur_depth - mean_depth) < 0.01:
+                weight = wp.exp(
+                    -float((u - w) * (u - w) + (h - v) * (h - v)) / (2.0 * sigmaD * sigmaD)
+                    - (depthCenter - cur_depth) * (depthCenter - cur_depth) / (2.0 * sigmaR * sigmaR)
+                )
+                sum_weight += weight
+                depth_sum += weight * cur_depth
+    if sum_weight > 0 and num_valid > 0:
+        out[h, w] = depth_sum / sum_weight
+
+
+def bilateral_filter_depth(
+    depth: torch.Tensor, radius: int = 2, zfar: float = 100, sigmaD: float = 2, sigmaR: float = 100000
+) -> torch.Tensor:
+    """Apply a bilateral filter to a depth map using Warp."""
+    depth_wp = wp.from_torch(depth)
+    out_wp = wp.zeros(depth.shape, dtype=float, device=str(depth.device))
+    wp.launch(
+        kernel=bilateral_filter_depth_kernel,
+        device=str(depth.device),
+        dim=[depth.shape[0], depth.shape[1]],
+        inputs=[depth_wp, out_wp, radius, zfar, sigmaD, sigmaR],
+    )
+    return wp.to_torch(out_wp)
+
+
+@wp.kernel(enable_backward=False)
+def erode_depth_kernel(
+    depth: wp.array(dtype=float, ndim=2),  # pyright: ignore reportInvalidType
+    out: wp.array(dtype=float, ndim=2),  # pyright: ignore reportInvalidType
+    radius: int,
+    depth_diff_thres: float,
+    ratio_thres: float,
+    zfar: float,
+) -> None:
+    """Warp kernel that erodes depth discontinuities."""
+    h, w = wp.tid()
+    H = depth.shape[0]
+    W = depth.shape[1]
+    if w >= W or h >= H:
+        return
+    d_ori = depth[h, w]
+    if d_ori < 0.001 or d_ori >= zfar:
         out[h, w] = 0.0
-        mean_depth = float(0)
-        num_valid = int(0.0)
-        for u in range(w - radius, w + radius + 1):
-            if u < 0 or u >= W:
+    bad_cnt = float(0)
+    total = float(0)
+    for u in range(w - radius, w + radius + 1):
+        if u < 0 or u >= W:
+            continue
+        for v in range(h - radius, h + radius + 1):
+            if v < 0 or v >= H:
                 continue
-            for v in range(h - radius, h + radius + 1):
-                if v < 0 or v >= H:
-                    continue
-                cur_depth = depth[v, u]
-                if cur_depth >= 0.001 and cur_depth < zfar:
-                    num_valid += 1
-                    mean_depth += cur_depth
-        if num_valid == 0:
-            return
-        mean_depth /= float(num_valid)
+            cur_depth = depth[v, u]
+            total += 1.0
+            if cur_depth < 0.001 or cur_depth >= zfar or abs(cur_depth - d_ori) > depth_diff_thres:
+                bad_cnt += 1.0
+    if bad_cnt / total > ratio_thres:
+        out[h, w] = 0.0
+    else:
+        out[h, w] = d_ori
 
-        depthCenter = depth[h, w]
-        sum_weight = float(0)
-        depth_sum = float(0)
-        for u in range(w - radius, w + radius + 1):
-            if u < 0 or u >= W:
-                continue
-            for v in range(h - radius, h + radius + 1):
-                if v < 0 or v >= H:
-                    continue
-                cur_depth = depth[v, u]
-                if cur_depth >= 0.001 and cur_depth < zfar and abs(cur_depth - mean_depth) < 0.01:
-                    weight = wp.exp(
-                        -float((u - w) * (u - w) + (h - v) * (h - v)) / (2.0 * sigmaD * sigmaD)
-                        - (depthCenter - cur_depth) * (depthCenter - cur_depth) / (2.0 * sigmaR * sigmaR)
-                    )
-                    sum_weight += weight
-                    depth_sum += weight * cur_depth
-        if sum_weight > 0 and num_valid > 0:
-            out[h, w] = depth_sum / sum_weight
 
-    def bilateral_filter_depth(
-        depth: torch.Tensor, radius: int = 2, zfar: float = 100, sigmaD: float = 2, sigmaR: float = 100000
-    ) -> torch.Tensor:
-        """Apply a bilateral filter to a depth map using Warp."""
-        depth_wp = wp.from_torch(depth)
-        out_wp = wp.zeros(depth.shape, dtype=float, device=str(depth.device))
-        wp.launch(
-            kernel=bilateral_filter_depth_kernel,
-            device=str(depth.device),
-            dim=[depth.shape[0], depth.shape[1]],
-            inputs=[depth_wp, out_wp, radius, zfar, sigmaD, sigmaR],
-        )
-        return wp.to_torch(out_wp)
-
-    @wp.kernel(enable_backward=False)
-    def erode_depth_kernel(
-        depth: wp.array(dtype=float, ndim=2),  # pyright: ignore reportInvalidType
-        out: wp.array(dtype=float, ndim=2),  # pyright: ignore reportInvalidType
-        radius: int,
-        depth_diff_thres: float,
-        ratio_thres: float,
-        zfar: float,
-    ) -> None:
-        """Warp kernel that erodes depth discontinuities."""
-        h, w = wp.tid()
-        H = depth.shape[0]
-        W = depth.shape[1]
-        if w >= W or h >= H:
-            return
-        d_ori = depth[h, w]
-        if d_ori < 0.001 or d_ori >= zfar:
-            out[h, w] = 0.0
-        bad_cnt = float(0)
-        total = float(0)
-        for u in range(w - radius, w + radius + 1):
-            if u < 0 or u >= W:
-                continue
-            for v in range(h - radius, h + radius + 1):
-                if v < 0 or v >= H:
-                    continue
-                cur_depth = depth[v, u]
-                total += 1.0
-                if cur_depth < 0.001 or cur_depth >= zfar or abs(cur_depth - d_ori) > depth_diff_thres:
-                    bad_cnt += 1.0
-        if bad_cnt / total > ratio_thres:
-            out[h, w] = 0.0
-        else:
-            out[h, w] = d_ori
-
-    def erode_depth(
-        depth: torch.Tensor,
-        radius: int = 2,
-        depth_diff_thres: float = 0.001,
-        ratio_thres: float = 0.8,
-        zfar: float = 100,
-    ) -> torch.Tensor:
-        """Erode unstable depth pixels using local agreement."""
-        depth_wp = wp.from_torch(depth)
-        out_wp = wp.zeros(depth.shape, dtype=float, device=str(depth.device))
-        wp.launch(
-            kernel=erode_depth_kernel,
-            device=str(depth.device),
-            dim=[depth.shape[0], depth.shape[1]],
-            inputs=[depth_wp, out_wp, radius, depth_diff_thres, ratio_thres, zfar],
-        )
-        return wp.to_torch(out_wp)
+def erode_depth(
+    depth: torch.Tensor, radius: int = 2, depth_diff_thres: float = 0.001, ratio_thres: float = 0.8, zfar: float = 100
+) -> torch.Tensor:
+    """Erode unstable depth pixels using local agreement."""
+    depth_wp = wp.from_torch(depth)
+    out_wp = wp.zeros(depth.shape, dtype=float, device=str(depth.device))
+    wp.launch(
+        kernel=erode_depth_kernel,
+        device=str(depth.device),
+        dim=[depth.shape[0], depth.shape[1]],
+        inputs=[depth_wp, out_wp, radius, depth_diff_thres, ratio_thres, zfar],
+    )
+    return wp.to_torch(out_wp)
 
 
 def depth2xyzmap(depth: torch.Tensor, intrinsics_px: torch.Tensor) -> torch.Tensor:
@@ -423,7 +419,6 @@ def compute_mesh_diameter(pts: torch.Tensor, n_sample: int | None = 1000, chunk_
     if len(pts) < 2:
         return 0.0
 
-    pts = torch.tensor(pts, dtype=torch.float32, device="cuda")
     if n_sample is not None and n_sample < len(pts):
         ids = torch.randperm(len(pts), device=pts.device)[:n_sample]
         pts = pts[ids]
