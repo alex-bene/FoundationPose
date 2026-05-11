@@ -264,6 +264,7 @@ def bilateral_filter_depth(
     depth: torch.Tensor, radius: int = 2, zfar: float = 100, sigmaD: float = 2, sigmaR: float = 100000
 ) -> torch.Tensor:
     """Apply a bilateral filter to a depth map using Warp."""
+    wp.init()
     depth_wp = wp.from_torch(depth)
     out_wp = wp.zeros(depth.shape, dtype=float, device=str(depth.device))
     wp.launch(
@@ -315,6 +316,7 @@ def erode_depth(
     depth: torch.Tensor, radius: int = 2, depth_diff_thres: float = 0.001, ratio_thres: float = 0.8, zfar: float = 100
 ) -> torch.Tensor:
     """Erode unstable depth pixels using local agreement."""
+    wp.init()
     depth_wp = wp.from_torch(depth)
     out_wp = wp.zeros(depth.shape, dtype=float, device=str(depth.device))
     wp.launch(

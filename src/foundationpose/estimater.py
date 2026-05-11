@@ -178,8 +178,22 @@ class FoundationPose:
         seed: int | None = 42,
         matching_mode: Literal["rgb_only", "rgbd_only", "both_rgbd_and_rgb"] = "rgbd_only",
         renderer_batch_size: int = 512,
+        force_valid_depth_on_mask: bool = False,
     ) -> FoundationPoseRegistrationOutput:
         """Estimate object pose hypotheses from an RGB-D frame and object mask.
+
+        Args:
+            image (torch.Tensor): Input RGB image. Shape: (H, W, 3).
+            depth (torch.Tensor): Input depth image. Shape: (H, W).
+            object_mask (torch.Tensor): Binary mask of the object in the image. Shape: (H, W).
+            intrinsics_px (torch.Tensor): Camera intrinsics in pixels. Shape: (3, 3).
+            iterations (int, optional): Number of refinement iterations. Defaults to 5.
+            seed (int | None, optional): Random seed for reproducibility. Defaults to 42.
+            matching_mode (Literal["rgb_only", "rgbd_only", "both_rgbd_and_rgb"], optional): Matching mode.
+                Defaults to "rgbd_only".
+            renderer_batch_size (int, optional): Batch size for rendering. Defaults to 512.
+            force_valid_depth_on_mask (bool, optional): Force a minumum number of valid depth values on mask.
+                Defaults to False.
 
         Returns:
             FoundationPoseRegistrationOutput: Registration result sorted by descending score.
@@ -195,11 +209,17 @@ class FoundationPose:
         object_mask = torch.as_tensor(object_mask, device=self.device, dtype=torch.float32)
         intrinsics_px = torch.as_tensor(intrinsics_px, device=self.device, dtype=torch.float32)
 
+        depth[~depth.isfinite()] = 0
         depth = erode_depth(depth, radius=2)
         depth = bilateral_filter_depth(depth, radius=2)
 
-        if ((depth >= 0.001) & (object_mask > 0)).sum() < 4:
-            logger.warning("too few valid points, return")
+        if ((object_mask > 0).sum() < 4) or (
+            (((depth >= 0.001) & (object_mask > 0)).sum() < 4) and force_valid_depth_on_mask
+        ):
+            if (object_mask > 0).sum() < 4:
+                logger.warning("Object mask has less than 4 pixels. Returning best translation guess.")
+            else:
+                logger.warning("Object mask has less than 4 pixels with valid depth. Returning best translation guess.")
             pose = torch.eye(4, dtype=torch.float32, device=self.device)
             pose[:3, 3] = self.guess_translation(depth=depth, mask=object_mask, intrinsics_px=intrinsics_px)
             poses = pose.reshape(1, 4, 4)
